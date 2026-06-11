@@ -81,6 +81,14 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
     intensity feature per compound, and builds the RT window.
     """
     gnps_df = gnps_df.copy()
+
+    if GNPS_COMPOUND_COL not in gnps_df.columns:
+        st.warning(
+            f"GNPS compound name column '{GNPS_COMPOUND_COL}' not found. "
+            "Name-based matching will be skipped for this polarity."
+        )
+        gnps_df[GNPS_COMPOUND_COL] = ""
+
     gnps_df['clean_cas'] = gnps_df.get(GNPS_CAS_COL, pd.Series(dtype=str)).apply(clean_cas)
     gnps_df['clean_smiles'] = gnps_df.get(GNPS_SMILES_COL, pd.Series(dtype=str)).apply(
         lambda s: "" if pd.isna(s) else str(s).strip()
@@ -101,7 +109,7 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
 
         match_cond = gnps_df.apply(
             lambda row: (t_cas != "" and row['clean_cas'] == t_cas) or
-                        (t_core != "" and t_core == get_core_name(row[GNPS_COMPOUND_COL])) or
+                        (t_core != "" and t_core == get_core_name(row.get(GNPS_COMPOUND_COL, ""))) or
                         (t_smiles != "" and row['clean_smiles'] != "" and row['clean_smiles'] == t_smiles) or
                         (t_formula != "" and row['clean_formula'] != "" and row['clean_formula'] == t_formula),
             axis=1
