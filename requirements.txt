@@ -2,6 +2,10 @@ streamlit
 pandas
 numpy
 matplotlib
+plotly
 pyteomics
+psims
 pyarrow
 lxml
+reportlab
+pillow

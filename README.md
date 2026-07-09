@@ -37,11 +37,9 @@ A Streamlit web application that converts **GNPS2** spectral library matches and
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/gnps2-quant.git
-cd gnps2-quant
+git clone https://github.com/rithi-krishnaraj/Quant-GNPS2.git
+cd Quant-GNPS2
 ```
-
-> Replace `your-username/gnps2-quant` with your actual GitHub repository URL.
 
 ### 2. Create and activate a virtual environment (recommended)
 
