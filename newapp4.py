@@ -1,5 +1,4 @@
 import os
-import tempfile
 import io
 import zipfile
 import pandas as pd
@@ -14,12 +13,227 @@ import argparse
 from pathlib import Path
 from pyteomics import mzml, mgf
 import streamlit as st
+from gnpsdata import taskresult
+from gnpsdata import workflow_fbmn
+import urllib
+import requests
 
 st.set_page_config(
     page_title="GNPS2-Quant | PRM Method Generator",
     page_icon="🔬",
     layout="wide"
 )
+
+# =============================================================================
+# GNPS DATA FETCHING HELPERS
+# =============================================================================
+#
+# NOTE on FBMN vs "Everything Bagel":
+# On GNPS2, "Everything Bagel" is not a separate workflow with its own output
+# structure -- it is simply the value of the FBMN pipeline's internal
+# `--featurefindingtool` parameter (EVERYTHING_BAGEL vs MZMINE vs OPENMS, etc.).
+# Both feature-finding tools are routed through the exact same MZmine-style
+# reformatting step and land in the exact same nf_output/ locations. So the
+# same candidate paths below work for both FBMN and Everything Bagel task IDs.
+#
+# Whether the resulting quantification file includes RT peak boundaries
+# (rt_range:min / rt_range:max) and peak-width (fwhm) columns depends on
+# whether the *original* MZmine export that was fed into the task was the
+# "full"/quant_full feature table or the minimal GNPS export. The reformatting
+# step does not drop columns, so if they were present going in, they'll be
+# present in nf_output/clustering/featuretable_reformated.csv coming out.
+# When they're not present, process_polarity() below falls back to using the
+# apex RT for both bounds so the app still produces usable RT windows instead
+# of crashing.
+
+GNPS2_LIBRARY_RESULTS_PATHS = [
+    "nf_output/library/merged_results_with_gnps.tsv",
+]
+
+GNPS2_QUANT_TABLE_PATHS = [
+    "nf_output/clustering/featuretable_reformated.csv",
+]
+
+GNPS2_MGF_PATHS = [
+    "nf_output/clustering/spectra_reformatted.mgf",  # requested by user as primary
+    "nf_output/clustering/specs_ms.mgf",             # primary consensus MS/MS spectra written by FBMN/Everything Bagel
+    "nf_output/network_overlay/specs_ms.mgf",        # fallback seen on some task configurations
+]
+
+
+def _fetch_gnps2_file_bytes(task_id, result_path):
+    """
+    Fetch raw bytes for a single GNPS2 task result file, trying the prod/beta/de
+    mirrors (the same fallback pattern gnpsdata.taskresult uses internally for
+    dataframe fetches, but for arbitrary binary/text files like MGFs).
+    Returns bytes on success, or None if the file couldn't be retrieved from any mirror.
+    """
+    for server in ["prod", "beta", "de"]:
+        try:
+            url = taskresult.determine_gnps2_resultfile_url(task_id, result_path, gnps2server=server)
+            resp = requests.get(url, timeout=120)
+            resp.raise_for_status()
+            if resp.content and len(resp.content) > 0:
+                return resp.content
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_gnps2_dataframe_multi(task_id, candidate_paths, delimiter="\t"):
+    """
+    Try a list of candidate result-file paths (in priority order) for a GNPS2 task,
+    returning the first one that successfully parses as a non-empty dataframe.
+    Returns (dataframe, matched_path) or (None, None) if nothing worked.
+    """
+    for path in candidate_paths:
+        try:
+            df = taskresult.get_gnps2_task_resultfile_dataframe(task_id, path, delimiter=delimiter)
+            if df is not None and not df.empty:
+                return df, path
+        except Exception:
+            continue
+    return None, None
+
+
+def _fetch_gnps2_bytes_multi(task_id, candidate_paths):
+    """
+    Try a list of candidate result-file paths (in priority order) for a GNPS2 task,
+    returning the first one that returns non-empty bytes.
+    Returns (bytes, matched_path) or (None, None).
+    """
+    for path in candidate_paths:
+        content = _fetch_gnps2_file_bytes(task_id, path)
+        if content:
+            return content, path
+    return None, None
+
+
+def _fetch_mgf_with_provided_logic(task_id, is_gnps2=True):
+    """
+    Uses the user-provided logic (download functions from gnpsdata) 
+    to retrieve the MGF file content.
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mgf") as tmp:
+        tmp_path = tmp.name
+    
+    try:
+        if is_gnps2:
+            # User's suggested GNPS2 path
+            taskresult.download_gnps2_task_resultfile(task_id, "nf_output/clustering/spectra_reformatted.mgf", tmp_path)
+        else:
+            # User's suggested GNPS1 path
+            taskresult.download_task_resultfile(task_id, "spectra_reformatted/", tmp_path)
+        
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            with open(tmp_path, 'rb') as f:
+                content = f.read()
+            return content
+    except Exception as e:
+        st.warning(f"Note: MGF retrieval via primary path failed, trying fallback... ({str(e)})")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    return None
+
+
+def _load_gnps1_task_data(task_id, fetch_mgf=True):
+    """GNPS1 (legacy proteomics2.ucsd.edu) fallback. Returns (gnps_df, mzmine_df, mgf_content, is_gnps2=False)."""
+    ft_url = f"https://proteomics2.ucsd.edu/ProteoSAFe/DownloadResultFile?task={task_id}&file=quantification_table_reformatted/&block=main"
+    an_url = f"https://proteomics2.ucsd.edu/ProteoSAFe/DownloadResultFile?task={task_id}&file=DB_result/&block=main"
+
+    mzmine_df = pd.read_csv(ft_url)
+    st.write("✓ Successfully pulled Quantification File (GNPS1)")
+
+    gnps_df = pd.read_csv(an_url, sep="\t")
+    st.write("✓ Successfully pulled Library Results (GNPS1)")
+
+    mgf_content = None
+    if fetch_mgf:
+        # Try provided logic first
+        mgf_content = _fetch_mgf_with_provided_logic(task_id, is_gnps2=False)
+        
+        # Fallback to direct request if needed
+        if not mgf_content:
+            mgf_url = f"https://proteomics2.ucsd.edu/ProteoSAFe/DownloadResultFile?task={task_id}&file=spectra/specs_ms.mgf&block=main"
+            try:
+                mgf_response = requests.get(mgf_url, timeout=120)
+                if mgf_response.status_code == 200 and len(mgf_response.content) > 0:
+                    mgf_content = mgf_response.content
+            except Exception:
+                pass
+        
+        if mgf_content:
+            st.write("✓ Successfully pulled Consensus MS/MS MGF (GNPS1)")
+        else:
+            st.warning("⚠️ Could not find Consensus MS/MS MGF in GNPS1 task.")
+
+    return gnps_df, mzmine_df, mgf_content, False
+
+
+def load_gnps_task_data(task_id, fetch_mgf=True):
+    """
+    Fetches required data from a GNPS2 task ID (FBMN or "Everything Bagel" --
+    both share the same nf_output structure), with a GNPS1 fallback for legacy tasks.
+    Returns (gnps_df, mzmine_df, mgf_content, is_gnps2)
+    """
+    # 1. Quantification File -- used as the signal that this is a reachable GNPS2 task.
+    mzmine_df, quant_path = _fetch_gnps2_dataframe_multi(task_id, GNPS2_QUANT_TABLE_PATHS, delimiter=",")
+
+    if mzmine_df is None:
+        # Doesn't look like a retrievable GNPS2 task -- try the GNPS1 fallback instead.
+        try:
+            return _load_gnps1_task_data(task_id, fetch_mgf=fetch_mgf)
+        except Exception as e2:
+            raise Exception(
+                f"Failed to fetch data for Task ID {task_id}. Tried GNPS2 paths "
+                f"({', '.join(GNPS2_QUANT_TABLE_PATHS)}) and the GNPS1 fallback. "
+                f"Last error: {str(e2)}"
+            )
+
+    st.write(f"✓ Successfully pulled Quantification File")
+    rt_start_found = find_column_ci(mzmine_df, MZMINE_RT_START_COL) in mzmine_df.columns
+    rt_end_found = find_column_ci(mzmine_df, MZMINE_RT_END_COL) in mzmine_df.columns
+    if rt_start_found and rt_end_found:
+        st.write("&nbsp;&nbsp;&nbsp;&nbsp;↳ RT boundary columns found (`rt_range:min` / `rt_range:max`) — full peak boundaries available.")
+    else:
+        st.info("ℹ️ No RT boundary columns in this quantification file")
+
+    # 2. Library Results (Annotations) -- since the quant table was found, this is confirmed to be
+    #    a GNPS2 task, so we no longer fall back to GNPS1 on subsequent failures (that would just
+    #    mask the real problem with an unrelated set of legacy URLs).
+    gnps_df, lib_path = _fetch_gnps2_dataframe_multi(task_id, GNPS2_LIBRARY_RESULTS_PATHS, delimiter="\t")
+    if gnps_df is None:
+        raise Exception(
+            f"Task {task_id} was found on GNPS2 (quantification file retrieved from `{quant_path}`), "
+            f"but the Library Results file could not be retrieved from "
+            f"`{GNPS2_LIBRARY_RESULTS_PATHS[0]}`. This can happen if no spectral library was selected "
+            f"for this job, or if the library search step failed/is still running."
+        )
+    st.write(f"✓ Successfully pulled Library Results")
+
+    # 3. Consensus MS/MS MGF (Conditional)
+    mgf_content = None
+    if fetch_mgf:
+        # Try provided logic first
+        mgf_content = _fetch_mgf_with_provided_logic(task_id, is_gnps2=True)
+        
+        # Fallback to multi-path search if needed
+        if not mgf_content:
+            mgf_content, mgf_path = _fetch_gnps2_bytes_multi(task_id, GNPS2_MGF_PATHS)
+            if mgf_content:
+                st.write(f"✓ Successfully pulled Consensus MS/MS MGF")
+        else:
+            st.write(f"✓ Successfully pulled Consensus MS/MS MGF")
+
+        if not mgf_content:
+            st.warning(
+                "⚠️ Could not find Consensus MS/MS MGF in GNPS2 task output. Tried: "
+                + ", ".join(f"`{p}`" for p in GNPS2_MGF_PATHS)
+            )
+
+    return gnps_df, mzmine_df, mgf_content, True
 
 # =============================================================================
 # DEFAULT COLUMN MAPPING CONSTANTS
@@ -75,16 +289,49 @@ def get_col_mapping():
 def find_column_ci(df, col_name):
     """
     Find a column in a dataframe case-insensitively.
+    Also handles common aliases for MZmine/GNPS columns.
     Returns the actual column name if found, otherwise returns the original col_name.
     """
     if col_name in df.columns:
         return col_name
     
     col_name_lower = col_name.lower()
+    
+    # 1. Direct case-insensitive match
     for actual_col in df.columns:
         if actual_col.lower() == col_name_lower:
             return actual_col
+            
+    # 2. Alias mapping for MZmine/GNPS common variations
+    aliases = {
+        "id": ["row id", "row_id", "scan", "scan#", "#scan#", "feature_id", "feature id"],
+        "mz": ["row m/z", "row_mz", "m/z", "mass", "precursor_mz", "precursor m/z"],
+        "rt": ["row retention time", "row_rt", "retention time", "retention_time", "scan_rt", "rt (min)"],
+        "rt_range:min": ["row_rt_min", "rt_min", "min_rt", "rtstart", "t start (min)", "rt_range:min"],
+        "rt_range:max": ["row_rt_max", "rt_max", "max_rt", "rtstop", "t stop (min)", "rt_range:max"],
+        "compound_name": ["compound", "compound name", "name", "metabolite", "identification", "standardized_compound"],
+        "#scan#": ["id", "scan", "scan#", "feature_id", "feature id", "row id", "row_id"],
+        "molecular_formula": ["formula", "mf", "chemical_formula"],
+        "adduct": ["precursor_type", "ion", "ion_type"],
+        "cas_number": ["cas", "cas_no", "cas#"],
+        "smiles": ["smiles_string", "smiles_canonical"],
+        "height": ["intensity", "area", "peak area", "peak height", "max intensity"],
+        "charge": ["z", "precursor charge", "precursor_charge"],
+    }
     
+    if col_name_lower in aliases:
+        for alias in aliases[col_name_lower]:
+            alias_lower = alias.lower()
+            for actual_col in df.columns:
+                if actual_col.lower() == alias_lower:
+                    return actual_col
+                    
+    # 3. Partial match fallback for height/intensity if nothing found yet
+    if col_name_lower == "height":
+        for actual_col in df.columns:
+            if "peak area" in actual_col.lower() or "peak height" in actual_col.lower() or "intensity" in actual_col.lower():
+                return actual_col
+
     return col_name  # Return original if not found
 
 def validate_columns_ci(df, required_cols, df_name="dataframe"):
@@ -507,6 +754,7 @@ def create_results_zip(results_dict, rt_window_mode='composite_margin'):
         # --- PDF REPORT ---
         pdf_data = create_pdf_report(results_dict)
         if pdf_data:
+            
             zf.writestr('PRM_Method_Report.pdf', pdf_data)
     
     zip_buffer.seek(0)
@@ -696,7 +944,6 @@ def parse_mgf_spectrum_list(mgf_file_content):
             pass
     
     return spectra
-
 
 def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, fragment_dedup_ppm=5, compound_match_ppm_tolerance=10):
     """
@@ -1172,18 +1419,38 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
 
     matched_gnps = pd.concat(matched_rows, ignore_index=True)
     
-    # Validate and map MZmine columns (case-insensitive)
-    required_mzmine_cols = [col_mzmine_scan, col_mzmine_mz, col_mzmine_rt, col_mzmine_rt_start, col_mzmine_rt_end]
+    # Validate and map MZmine columns (case-insensitive).
+    # rt_range:min / rt_range:max (peak boundaries) are intentionally NOT required here --
+    # not every source table includes them (depends on whether the original MZmine export
+    # was the full/quant_full feature table or the minimal GNPS export, and this can differ
+    # between GNPS2 task data and a manually uploaded CSV). When absent, we fall back to
+    # apex RT for both bounds below so RT-window calculation still works.
+    required_mzmine_cols = [col_mzmine_scan, col_mzmine_mz, col_mzmine_rt]
     mzmine_col_map = validate_columns_ci(mzmine_df, required_mzmine_cols, "MZmine data")
     
     # Map to actual column names in the dataframe
     col_mzmine_scan = mzmine_col_map[col_mzmine_scan]
     col_mzmine_mz = mzmine_col_map[col_mzmine_mz]
     col_mzmine_rt = mzmine_col_map[col_mzmine_rt]
-    col_mzmine_rt_start = mzmine_col_map[col_mzmine_rt_start]
-    col_mzmine_rt_end = mzmine_col_map[col_mzmine_rt_end]
     col_mzmine_height = find_column_ci(mzmine_df, col_mzmine_height)
     col_mzmine_charge = find_column_ci(mzmine_df, col_mzmine_charge)
+
+    # RT boundary columns are optional -- fall back to apex RT for both bounds if absent.
+    resolved_rt_start = find_column_ci(mzmine_df, col_mzmine_rt_start)
+    resolved_rt_end = find_column_ci(mzmine_df, col_mzmine_rt_end)
+    if resolved_rt_start in mzmine_df.columns and resolved_rt_end in mzmine_df.columns:
+        col_mzmine_rt_start = resolved_rt_start
+        col_mzmine_rt_end = resolved_rt_end
+    else:
+        col_mzmine_rt_start = '__fallback_rt_start'
+        col_mzmine_rt_end = '__fallback_rt_end'
+        mzmine_df[col_mzmine_rt_start] = mzmine_df[col_mzmine_rt]
+        mzmine_df[col_mzmine_rt_end] = mzmine_df[col_mzmine_rt]
+        st.warning(
+            f"⚠️ [{polarity}] RT boundary columns (`{MZMINE_RT_START_COL}` / `{MZMINE_RT_END_COL}`) not found "
+            f"in the MZmine data — falling back to apex RT for peak boundaries. Composite/FWHM-boundary RT "
+            f"window modes will behave like their symmetric-margin equivalents for these compounds."
+        )
     
     # Automatically identify any fwhm columns (e.g., datafile:samplename.mzML:fwhm)
     fwhm_cols = [c for c in mzmine_df.columns if 'fwhm' in str(c).lower()]
@@ -1768,123 +2035,321 @@ with st.sidebar:
 st.title("🔬 GNPS2-Quant Method Optimizer")
 st.markdown("Optimize Points-Per-Peak prior to exporting your Thermo Exploris 480 Inclusion Lists.")
 st.markdown("**Workflow:** Match your DDA datasets (GNPS2 + MZmine results) against a target compound list.")
+# Information section about the page
+with st.expander("ℹ️ About GNPS2-Quant Method Optimizer", expanded=True):
+    st.markdown("""
+    **GNPS2-Quant** is a workflow optimization platform designed to generate high-quality **Parallel Reaction Monitoring (PRM) Inclusion Lists** for target compounds. 
+    
+    By matching compound reference lists against Data-Dependent Acquisition (DDA) experiment results (from **GNPS2 spectral libraries** and **MZmine 3 feature tables**), the tool:
+    - **Finds the best chromatographic peaks** case-insensitively across multiple datasets.
+    - **Models instrument constraints** (transient times and maximum injection times) on the **Thermo Exploris 480** mass spectrometer.
+    - **Predicts cycle times & Points-Per-Peak** to ensure you acquire enough data points across each chromatographic peak.
+    - **Generates Skyline Transition Lists** by extracting consensus fragment ions directly from library `.mgf` spectra.
+    - **Optimizes method concurrency** by splitting targets into multiplexed inclusion lists.
+    """)
 
-st.markdown("""
----
-**💡 How it works:**
-1. Upload your **target compound list** (Compounds.csv)
-2. Upload **DDA experiment results** — can be 1 experiment or many (e.g., 5 different methods)
-3. The script will match compounds across all datasets and select the best peak for each
-4. Results are combined and optimized for your PRM method
+# Initialize data variables to avoid NameErrors in Status table when switching modes
+f_compounds = None
+f_gnps_pos, f_mzmine_pos = [], []
+f_gnps_neg, f_mzmine_neg = [], []
+f_mzml_pos, f_mzml_neg = None, None
+mgf_pos_files, mgf_neg_files = [], []
 
----
-""")
+# Use session state to persist global options
+if "generate_skyline" not in st.session_state:
+    st.session_state.generate_skyline = False
 
-st.subheader("📋 Step 1: Upload Target Compound List")
-st.markdown("""
-This is your **internal reference library** — the compounds you want to target in your PRM method.
-""")
-f_compounds = st.file_uploader("Compounds.csv (Required)", type=["csv"], key="compounds_upload")
+# Ensure fetched data state exists
+if 'gnps_data_fetched' not in st.session_state:
+    st.session_state['gnps_data_fetched'] = None
 
-st.subheader("📁 Step 2: Upload DDA Datasets")
-st.markdown("""
-Upload your DDA experiment results. **You can load multiple datasets** from different experiments or methods.
+st.radio("Input Method", options=["Manual Input", "GNPS2 Task ID", "Test Data"], index=0, key="input_mode", help="Choose how to provide your data for processing")
 
-**How to upload multiple datasets:**
-- Upload multiple GNPS2 result files (e.g., from different experiments)
-- Upload the corresponding MZmine feature tables **in the same order**
-- The script will process each GNPS/MZmine pair separately, then combine results
-- Results from all datasets are aggregated and compared (highest intensity wins per compound)
+generate_skyline = st.session_state.generate_skyline
+    
+if st.session_state.input_mode == "Manual Input":
+    with st.expander("💡 How it works:"):
+        st.markdown("""
+        1. Upload your **target compound list** (Compounds.csv)
+        2. Upload **DDA experiment results** — can be 1 experiment or many (e.g., 5 different methods)
+        3. The script will match compounds across all datasets and select the best peak for each
+        4. Results are combined and optimized for your PRM method
+        """)
+    step1, step2, step3 = st.tabs(["Step 1: Upload Target Compound List", "Step 2: Upload DDA Datasets", "Step 3: Optional Raw Data & Skyline Export"])
+    with step1:
+        st.subheader("📋 Step 1: Upload Target Compound List")
+        st.markdown("""
+            This is your **internal reference library** — the compounds you want to target in your PRM method.
+            """)
+        f_compounds = st.file_uploader("Compounds.csv (Required)", type=["csv"], key="compounds_upload")
 
-**Example:** If you upload GNPS files [exp1.csv, exp2.csv, exp3.csv], 
-upload MZmine files [exp1_feat.csv, exp2_feat.csv, exp3_feat.csv] in the **same order**.
-""")
+    with step2:
+        st.subheader("📁 Step 2: Upload DDA Datasets")
+        st.markdown("""Upload your DDA experiment results. **You can load multiple datasets** from different experiments or methods.""")
+        with st.expander("How to upload multiple datasets:"):
+            st.markdown(""" 
+            - Upload multiple GNPS2 result files (e.g., from different experiments)
+            - Upload the corresponding MZmine feature tables **in the same order**
+            - The script will process each GNPS/MZmine pair separately, then combine results
+            - Results from all datasets are aggregated and compared (highest intensity wins per compound)
 
-col1, col2 = st.columns(2)
+            **Example:** If you upload GNPS files [exp1.csv, exp2.csv, exp3.csv], 
+            upload MZmine files [exp1_feat.csv, exp2_feat.csv, exp3_feat.csv] in the **same order**.
+            """)
 
-# Positive mode files
-if polarity_mode in ["Positive & Negative", "Positive Only"]:
-    with col1:
-        st.subheader("📍 ESI+ (Positive Mode)")
-        st.caption("GNPS2 results and MZmine feature tables for ESI+ — upload in matching order")
-        f_gnps_pos = st.file_uploader("GNPS2 Results — ESI+ (.csv)", type=["csv"], accept_multiple_files=True, key="gnps_pos")
-        f_mzmine_pos = st.file_uploader("MZmine 3 Features — ESI+ (.csv)", type=["csv"], accept_multiple_files=True, key="mzmine_pos")
+        col1, col2 = st.columns(2)
+
+        # Positive mode files
+        if polarity_mode in ["Positive & Negative", "Positive Only"]:
+            with col1:
+                st.subheader("📍 ESI+ (Positive Mode)")
+                st.caption("GNPS2 results and MZmine feature tables for ESI+ — upload in matching order")
+                f_gnps_pos = st.file_uploader("GNPS2 Results — ESI+ (.csv, .tsv)", type=["csv", "tsv"], accept_multiple_files=True, key="gnps_pos")
+                f_mzmine_pos = st.file_uploader("MZmine 3 Features — ESI+ (.csv, .tsv)", type=["csv", "tsv"], accept_multiple_files=True, key="mzmine_pos")
+        else:
+            f_gnps_pos = []
+            f_mzmine_pos = []
+
+        # Negative mode files
+        if polarity_mode in ["Positive & Negative", "Negative Only"]:
+            if polarity_mode == "Positive & Negative":
+                with col2:
+                    st.subheader("📍 ESI− (Negative Mode)")
+                    st.caption("GNPS2 results and MZmine feature tables for ESI− — upload in matching order")
+                    f_gnps_neg = st.file_uploader("GNPS2 Results — ESI− (.csv, .tsv)", type=["csv", "tsv"], accept_multiple_files=True, key="gnps_neg")
+                    f_mzmine_neg = st.file_uploader("MZmine 3 Features — ESI− (.csv, .tsv)", type=["csv", "tsv"], accept_multiple_files=True, key="mzmine_neg")
+            else:
+                st.subheader("📍 ESI− (Negative Mode)")
+                st.caption("GNPS2 results and MZmine feature tables for ESI− — upload in matching order")
+                f_gnps_neg = st.file_uploader("GNPS2 Results — ESI− (.csv, .tsv)", type=["csv", "tsv"], accept_multiple_files=True, key="gnps_neg")
+                f_mzmine_neg = st.file_uploader("MZmine 3 Features — ESI− (.csv, .tsv)", type=["csv", "tsv"], accept_multiple_files=True, key="mzmine_neg")
+        else:
+            f_gnps_neg = []
+            f_mzmine_neg = []
+
+    with step3:
+        st.subheader("📊 Step 3: Optional Raw Data & Skyline Export")
+        # Optional LC-MS raw data for XIC visualization
+        st.markdown("**LC-MS Raw Data (optional)** — for TIC and XIC chromatograms")
+        f_mzml_pos = None
+        f_mzml_neg = None
+        if polarity_mode in ["Positive & Negative", "Positive Only"]:
+            f_mzml_pos = st.file_uploader("LC-MS Raw Data (.mzML) — ESI+", type=["mzML", "mzml"], key="mzml_pos", help="Leave empty to skip XIC extraction (speeds up processing)")
+        if polarity_mode in ["Positive & Negative", "Negative Only"]:
+            f_mzml_neg = st.file_uploader("LC-MS Raw Data (.mzML) — ESI−", type=["mzML", "mzml"], key="mzml_neg", help="Leave empty to skip XIC extraction (speeds up processing)")
+
+        # MGF uploaders are gated by the global generate_skyline setting
+        mgf_pos_files = []
+        mgf_neg_files = []
+        
+        generate_skyline = st.checkbox(
+            "Generate Skyline Mass List? (Extracts fragments from MGF)", 
+            value=st.session_state.generate_skyline,
+            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires MGF files to be uploaded below.",
+            key="skyline_manual"
+        )
+        if generate_skyline:
+            st.info("Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.")
+            
+        if generate_skyline != st.session_state.generate_skyline:
+            st.session_state.generate_skyline = generate_skyline
+            st.rerun()
+
+        if generate_skyline:
+            if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                mgf_pos_files = st.file_uploader("GNPS MGF — ESI+ (.mgf)", type=["mgf"], accept_multiple_files=True, key="mgf_pos_manual", help="Consensus MS/MS MGF from GNPS")
+            if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                mgf_neg_files = st.file_uploader("GNPS MGF — ESI− (.mgf)", type=["mgf"], accept_multiple_files=True, key="mgf_neg_manual", help="Consensus MS/MS MGF from GNPS")
+        else:
+            st.info("💡 **Tip:** Enable 'Generate Skyline Mass List' above if you want to include fragment ions in your results.")
+
+elif st.session_state.input_mode == "GNPS2 Task ID":
+    step1, step2 = st.tabs(["Step 1: Upload Target Compound List", "Step 2: Enter GNPS2 Task ID"])
+    with step1: 
+        st.subheader("📋 Step 1: Upload Target Compound List")
+        st.markdown("""
+            This is your **internal reference library** — the compounds you want to target in your PRM method.
+            """)
+        f_compounds = st.file_uploader("Compounds.csv (Required)", type=["csv"], key="compounds_upload")
+    with step2: 
+        st.subheader("📁 Step 2: Enter GNPS2 Task ID")
+        task_id = st.text_input("GNPS2 Task ID", placeholder="Enter GNPS2 Task ID (e.g., 1234567890abcdef)", key="gnps_task_id")
+        
+        generate_skyline = st.checkbox(
+            "Generate Skyline Mass List? (Extracts fragments from MGF)", 
+            value=st.session_state.generate_skyline,
+            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires fetching the Consensus MS/MS MGF from GNPS.",
+            key="skyline_taskid"
+        )
+        if generate_skyline:
+            st.info("ℹ️ Skyline transitions require: (1) MGF files fetched from GNPS, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is found, or nothing matches, no Skyline file will be generated.")
+            
+        if generate_skyline != st.session_state.generate_skyline:
+            st.session_state.generate_skyline = generate_skyline
+            st.rerun()
+
+        # Use global generate_skyline setting for MGF fetching
+        fetch_mgf_choice = generate_skyline
+
+        # Fetch button
+        if st.button("🌐 Fetch GNPS Task ID", disabled=not (len(task_id) > 5)):
+            with st.status("Fetching GNPS Task Data...", expanded=True):
+                try:
+                    gnps_df, mzmine_df, mgf_content, is_gnps2 = load_gnps_task_data(task_id, fetch_mgf=fetch_mgf_choice)
+                    st.session_state['gnps_data_fetched'] = {
+                        'gnps_df': gnps_df,
+                        'mzmine_df': mzmine_df,
+                        'mgf_content': mgf_content,
+                        'is_gnps2': is_gnps2,
+                        'task_id': task_id,
+                        'mgf_fetched': fetch_mgf_choice
+                    }
+                    st.success(f"✓ Successfully fetched data for Task ID: {task_id}")
+                except Exception as e:
+                    st.error(f"Error fetching data: {str(e)}")
+
 else:
-    f_gnps_pos = []
-    f_mzmine_pos = []
-
-# Negative mode files
-if polarity_mode in ["Positive & Negative", "Negative Only"]:
-    if polarity_mode == "Positive & Negative":
-        with col2:
-            st.subheader("📍 ESI− (Negative Mode)")
-            st.caption("GNPS2 results and MZmine feature tables for ESI− — upload in matching order")
-            f_gnps_neg = st.file_uploader("GNPS2 Results — ESI− (.csv)", type=["csv"], accept_multiple_files=True, key="gnps_neg")
-            f_mzmine_neg = st.file_uploader("MZmine 3 Features — ESI− (.csv)", type=["csv"], accept_multiple_files=True, key="mzmine_neg")
-    else:
-        st.subheader("📍 ESI− (Negative Mode)")
-        st.caption("GNPS2 results and MZmine feature tables for ESI− — upload in matching order")
-        f_gnps_neg = st.file_uploader("GNPS2 Results — ESI− (.csv)", type=["csv"], accept_multiple_files=True, key="gnps_neg")
-        f_mzmine_neg = st.file_uploader("MZmine 3 Features — ESI− (.csv)", type=["csv"], accept_multiple_files=True, key="mzmine_neg")
-else:
-    f_gnps_neg = []
-    f_mzmine_neg = []
-
-st.divider()
-st.subheader("📊 Step 3: Optional Raw Data & Skyline Export")
-
-# Optional LC-MS raw data for XIC visualization
-st.markdown("**LC-MS Raw Data (optional)** — for TIC and XIC chromatograms")
-f_mzml_pos = None
-f_mzml_neg = None
-if polarity_mode in ["Positive & Negative", "Positive Only"]:
-    f_mzml_pos = st.file_uploader("LC-MS Raw Data (.mzML) — ESI+", type=["mzML", "mzml"], key="mzml_pos", help="Leave empty to skip XIC extraction (speeds up processing)")
-if polarity_mode in ["Positive & Negative", "Negative Only"]:
-    f_mzml_neg = st.file_uploader("LC-MS Raw Data (.mzML) — ESI−", type=["mzML", "mzml"], key="mzml_neg", help="Leave empty to skip XIC extraction (speeds up processing)")
-
-st.divider()
-generate_skyline = st.checkbox("Generate Skyline Mass List? (Extracts fragments from MGF)", value=False, help="Requires MGF files with fragment peak data")
-mgf_pos_files = []
-mgf_neg_files = []
-if generate_skyline:
-    st.info(f"ℹ️ Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±{compound_match_ppm_tolerance} ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.")
-    if polarity_mode in ["Positive & Negative", "Positive Only"]:
-        mgf_pos_files = st.file_uploader("GNPS MGF — ESI+ (.mgf)", type=["mgf"], accept_multiple_files=True, key="mgf_pos", help="Consensus MS/MS MGF from GNPS")
-    if polarity_mode in ["Positive & Negative", "Negative Only"]:
-        mgf_neg_files = st.file_uploader("GNPS MGF — ESI− (.mgf)", type=["mgf"], accept_multiple_files=True, key="mgf_neg", help="Consensus MS/MS MGF from GNPS")
-
-st.divider()
+    st.write("**Test Data:** Use example datasets to test the workflow and visualize results.") 
 
 # Validation
 if f_compounds is None:
     st.warning("⚠️ Upload a Compounds.csv file to proceed")
     st.stop()
 
-required_pos_match = len(f_gnps_pos) == len(f_mzmine_pos)
-required_neg_match = len(f_gnps_neg) == len(f_mzmine_neg)
-has_any_data = (len(f_gnps_pos) > 0 and required_pos_match) or (len(f_gnps_neg) > 0 and required_neg_match)
+if st.session_state.input_mode == "Manual Input":
+    required_pos_match = len(f_gnps_pos) == len(f_mzmine_pos)
+    required_neg_match = len(f_gnps_neg) == len(f_mzmine_neg)
+    has_any_data = (len(f_gnps_pos) > 0 and required_pos_match) or (len(f_gnps_neg) > 0 and required_neg_match)
 
-if not has_any_data:
-    st.info("📥 Upload matching pairs of GNPS and MZmine files to proceed.")
-elif not required_pos_match or not required_neg_match:
-    st.error("❌ Number of GNPS files must equal the number of MZmine files for each polarity.")
+    if not has_any_data:
+        st.info("📥 Upload matching pairs of GNPS and MZmine files to proceed.")
+    elif not required_pos_match or not required_neg_match:
+        st.error("❌ Number of GNPS files must equal the number of MZmine files for each polarity.")
+    
+    all_ready = has_any_data and (f_compounds is not None)
+elif st.session_state.input_mode == "GNPS2 Task ID":
+    # Check if data has been fetched for the current task_id
+    fetched = st.session_state.get('gnps_data_fetched')
+    task_id = st.session_state.get('gnps_task_id', '')
+    
+    data_ready = fetched is not None and fetched.get('task_id') == task_id
+    
+    # Check if MGF is needed but not fetched
+    mgf_needed_but_missing = generate_skyline and data_ready and not fetched.get('mgf_fetched')
+    
+    if mgf_needed_but_missing:
+        st.warning("⚠️ Skyline output is enabled in the sidebar, but your currently fetched GNPS data does not include the MGF file. Click '🌐 Fetch GNPS Task ID' again to retrieve it.")
+        all_ready = False
+    else:
+        all_ready = data_ready and (f_compounds is not None)
+    
+    if not all_ready:
+        if not data_ready:
+            st.info("📥 Enter a GNPS Task ID and click '🌐 Fetch GNPS Task ID' to proceed.")
+        elif mgf_needed_but_missing:
+            pass # warning already shown
+        elif f_compounds is None:
+            st.info("📥 Upload a Compounds.csv file to proceed.")
+else:
+    # Test Data mode
+    all_ready = (f_compounds is not None)
 
-all_ready = has_any_data and (f_compounds is not None)
-
-# Display upload status
+# Display upload status in a color-coded table
 st.divider()
 st.subheader("📋 Upload Status")
-col1, col2 = st.columns(2)
-with col1:
-    st.write(f"**Compounds.csv:** ✓ Loaded")
-    st.write(f"**ESI+ GNPS files:** {len(f_gnps_pos)} files")
-    st.write(f"**ESI+ MZmine files:** {len(f_mzmine_pos)} files")
-    st.write(f"**ESI+ mzML file:** {'✓ Uploaded' if f_mzml_pos else '✗ Not uploaded'}")
-with col2:
-    st.write(f"**ESI− GNPS files:** {len(f_gnps_neg)} files")
-    st.write(f"**ESI− MZmine files:** {len(f_mzmine_neg)} files")
-    st.write(f"**ESI− mzML file:** {'✓ Uploaded' if f_mzml_neg else '✗ Not uploaded'}")
-st.divider()
+
+# Determine GNPS status message for Task ID mode
+gnps_status = "✗ Not fetched"
+if st.session_state.get('input_mode') == "GNPS2 Task ID":
+    fetched = st.session_state.get('gnps_data_fetched')
+    if fetched and fetched.get('task_id') == st.session_state.get('gnps_task_id'):
+        gnps_status = "✓ Data Fetched"
+        if fetched.get('mgf_fetched'):
+            if fetched.get('mgf_content'):
+                gnps_status += " (MGF included)"
+            else:
+                gnps_status += " (MGF not found)"
+        else:
+            gnps_status += " (MGF skipped)"
+
+status_data = {
+    "Data / Channel": [
+        "Reference Library (Compounds.csv)",
+        "ESI+ (Positive Mode) GNPS2",
+        "ESI+ (Positive Mode) MZmine 3",
+        "ESI+ (Positive Mode) Raw mzML",
+        "ESI− (Negative Mode) GNPS2",
+        "ESI− (Negative Mode) MZmine 3",
+        "ESI− (Negative Mode) Raw mzML"
+    ],
+    "Status": [
+        "✓ Loaded" if f_compounds is not None else "✗ Missing",
+        f"✓ {len(f_gnps_pos)} files" if f_gnps_pos else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
+        f"✓ {len(f_mzmine_pos)} files" if f_mzmine_pos else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
+        "✓ Uploaded" if f_mzml_pos else "✗ Not uploaded",
+        f"✓ {len(f_gnps_neg)} files" if f_gnps_neg else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
+        f"✓ {len(f_mzmine_neg)} files" if f_mzmine_neg else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
+        "✓ Uploaded" if f_mzml_neg else "✗ Not uploaded"
+    ]
+}
+
+# Add Skyline status if enabled
+if generate_skyline:
+    input_mode = st.session_state.get('input_mode')
+    if input_mode == "Manual Input":
+        status_data["Data / Channel"].extend(["ESI+ (Positive Mode) GNPS MGF", "ESI− (Negative Mode) GNPS MGF"])
+        status_data["Status"].extend([
+            f"✓ {len(mgf_pos_files)} files" if mgf_pos_files else "✗ Not uploaded",
+            f"✓ {len(mgf_neg_files)} files" if mgf_neg_files else "✗ Not uploaded"
+        ])
+    elif input_mode == "GNPS2 Task ID":
+        fetched = st.session_state.get('gnps_data_fetched')
+        mgf_state = "✗ Not fetched"
+        if fetched and fetched.get('task_id') == st.session_state.get('gnps_task_id'):
+            if fetched.get('mgf_content'):
+                mgf_state = "✓ MGF Fetched"
+            elif fetched.get('mgf_fetched'):
+                mgf_state = "✗ MGF Not Found"
+            else:
+                mgf_state = "✗ MGF Skipped"
+        
+        status_data["Data / Channel"].append("Consensus MS/MS MGF (Skyline)")
+        status_data["Status"].append(mgf_state)
+
+status_df = pd.DataFrame(status_data)
+
+# Define custom styling for Status column
+def style_status_rows(row):
+    status = row["Status"]
+    text_color = ""
+    
+    if "✗" in status:
+        text_color = "#c62828"  # Red for missing/not uploaded/skipped
+    elif "✓" in status:
+        if "Loaded" in status or "files" in status or "Fetched" in status:
+            text_color = "#2e7d32"  # Green for uploaded/required/fetched data
+        elif "Uploaded" in status:
+            text_color = "#1565c0"  # Blue for optional files uploaded (mzML)
+        
+    style_str = f"color: {text_color}; font-weight: bold;" if text_color else ""
+    # Style only the Status column (second column)
+    return ["", style_str]
+
+styled_status_df = status_df.style.apply(style_status_rows, axis=1)
+st.dataframe(styled_status_df, use_container_width=True, hide_index=True)
+
+# Global Method Options
+st.subheader("Multiplex Splitting Decision")
+split_method = st.checkbox(
+    "Split into 2 Multiplex Groups?", 
+    value=st.session_state.get('split_method_selected', False),
+    help="Divides targets into two separate inclusion lists to drastically improve Points/Peak. Click the 'Evaluate & Optimize Method' button below to apply this change.",
+    key="split_checkbox"
+)
+
+# Update session state with the current checkbox value
+if split_method != st.session_state.get('split_method_selected', False):
+    st.session_state['split_method_selected'] = split_method
 
 if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_ready):
     with st.status("Evaluating Method Constraints...", expanded=True) as status:
@@ -1896,7 +2361,9 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
             else:
                 all_compounds = set()
                 for f in (f_gnps_pos + f_gnps_neg):
-                    f.seek(0); temp_df = pd.read_csv(f, encoding='latin1')
+                    f.seek(0)
+                    f_sep = '\t' if f.name.lower().endswith('.tsv') else ','
+                    temp_df = pd.read_csv(f, sep=f_sep, encoding='latin1')
                     if 'Compound_Name' in temp_df.columns: all_compounds.update(temp_df['Compound_Name'].dropna().unique())
                 targets = pd.DataFrame({'Compound': list(all_compounds)})
                 targets['clean_cas'] = ""
@@ -1908,9 +2375,12 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
                 col_map = get_col_mapping()
                 for g, m in zip(sorted(g_files, key=lambda x: x.name), sorted(m_files, key=lambda x: x.name)):
                     g.seek(0); m.seek(0)
+                    # Determine delimiters
+                    g_sep = '\t' if g.name.lower().endswith('.tsv') else ','
+                    m_sep = '\t' if m.name.lower().endswith('.tsv') else ','
                     res = process_polarity(
-                        pd.read_csv(g, encoding='latin1'), 
-                        pd.read_csv(m, encoding='latin1'), 
+                        pd.read_csv(g, sep=g_sep, encoding='latin1'), 
+                        pd.read_csv(m, sep=m_sep, encoding='latin1'), 
                         pol, targets, "25,35,45", 
                         rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min,
                         col_gnps_compound=col_map['gnps_compound'],
@@ -1937,30 +2407,113 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
             targets_pos = pd.DataFrame()
             targets_neg = pd.DataFrame()
             
-            # Load targets from Compounds.csv (Targeted workflow)
-            f_compounds.seek(0)
-            targets = pd.read_csv(f_compounds, encoding='latin1')
-            col_map = get_col_mapping()
-            targets['clean_cas'] = targets.get(col_map['targets_cas'], pd.Series(dtype=str)).apply(clean_cas)
-            st.write(f"✓ Loaded {len(targets)} target compounds from Compounds.csv")
-            st.write(f"✓ Processing {len(f_gnps_pos) if f_gnps_pos else 0} ESI+ dataset(s)")
-            st.write(f"✓ Processing {len(f_gnps_neg) if f_gnps_neg else 0} ESI− dataset(s)")
-            st.info(f"📊 mzML files: ESI+ = {'✓ Uploaded' if f_mzml_pos else '✗ Not uploaded'}, ESI− = {'✓ Uploaded' if f_mzml_neg else '✗ Not uploaded'}")
+            if st.session_state.input_mode == "GNPS2 Task ID":
+                fetched = st.session_state.get('gnps_data_fetched')
+                if fetched:
+                    gnps_df = fetched['gnps_df']
+                    mzmine_df = fetched['mzmine_df']
+                    mgf_content = fetched['mgf_content']
+                    is_gnps2 = fetched['is_gnps2']
+                    task_id = fetched['task_id']
+                    st.write(f"✓ Using cached data for Task ID: `{task_id}`")
+                else:
+                    # Fallback fetch
+                    task_id = st.session_state.get('gnps_task_id', '')
+                    st.write(f"🌐 **Fetching data for GNPS Task ID:** `{task_id}`...")
+                    gnps_df, mzmine_df, mgf_content, is_gnps2 = load_gnps_task_data(task_id)
+                
+                st.success(f"✓ Successfully fetched data from {'GNPS2' if is_gnps2 else 'GNPS1'}")
+                
+                # Get custom column mappings from session state
+                col_map = get_col_mapping()
+
+                # Process based on selected polarity mode
+                if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                    st.write("🔍 Matching ESI+ targets...")
+                    targets_pos = process_polarity(
+                        gnps_df, mzmine_df, "Positive", targets, "25,35,45", 
+                        rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min,
+                        col_gnps_compound=col_map['gnps_compound'],
+                        col_gnps_scan=col_map['gnps_scan'],
+                        col_gnps_cas=col_map['gnps_cas'],
+                        col_gnps_smiles=col_map['gnps_smiles'],
+                        col_gnps_formula=col_map['gnps_formula'],
+                        col_gnps_adduct=col_map['gnps_adduct'],
+                        col_mzmine_scan=col_map['mzmine_scan'],
+                        col_mzmine_mz=col_map['mzmine_mz'],
+                        col_mzmine_rt=col_map['mzmine_rt'],
+                        col_mzmine_rt_start=col_map['mzmine_rt_start'],
+                        col_mzmine_rt_end=col_map['mzmine_rt_end'],
+                        col_mzmine_height=col_map['mzmine_height'],
+                        col_mzmine_charge=col_map['mzmine_charge'],
+                        col_targets_compound=col_map['targets_compound'],
+                        col_targets_cas=col_map['targets_cas'],
+                        col_targets_smiles=col_map['targets_smiles'],
+                        col_targets_formula=col_map['targets_formula']
+                    )
+                
+                if (polarity_mode == "Negative Only") or (polarity_mode == "Positive & Negative" and targets_pos.empty):
+                     st.write("🔍 Matching ESI− targets...")
+                     targets_neg = process_polarity(
+                        gnps_df, mzmine_df, "Negative", targets, "25,35,45", 
+                        rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min,
+                        col_gnps_compound=col_map['gnps_compound'],
+                        col_gnps_scan=col_map['gnps_scan'],
+                        col_gnps_cas=col_map['gnps_cas'],
+                        col_gnps_smiles=col_map['gnps_smiles'],
+                        col_gnps_formula=col_map['gnps_formula'],
+                        col_gnps_adduct=col_map['gnps_adduct'],
+                        col_mzmine_scan=col_map['mzmine_scan'],
+                        col_mzmine_mz=col_map['mzmine_mz'],
+                        col_mzmine_rt=col_map['mzmine_rt'],
+                        col_mzmine_rt_start=col_map['mzmine_rt_start'],
+                        col_mzmine_rt_end=col_map['mzmine_rt_end'],
+                        col_mzmine_height=col_map['mzmine_height'],
+                        col_mzmine_charge=col_map['mzmine_charge'],
+                        col_targets_compound=col_map['targets_compound'],
+                        col_targets_cas=col_map['targets_cas'],
+                        col_targets_smiles=col_map['targets_smiles'],
+                        col_targets_formula=col_map['targets_formula']
+                    )
+                
+                if generate_skyline and mgf_content:
+                    mgf_file = io.BytesIO(mgf_content)
+                    mgf_file.name = f"{task_id}.mgf"
+                    if not targets_pos.empty:
+                        mgf_pos_files = [mgf_file]
+                    if not targets_neg.empty:
+                        mgf_neg_files = [mgf_file]
             
-            # Process based on selected polarity mode
-            if polarity_mode in ["Positive & Negative", "Positive Only"]:
-                targets_pos = run_polarity_multipe(f_gnps_pos, f_mzmine_pos, "Positive")
+            elif st.session_state.input_mode == "Manual Input":
+                # Load targets from Compounds.csv (Targeted workflow)
+                f_compounds.seek(0)
+                targets = pd.read_csv(f_compounds, encoding='latin1')
+                col_map = get_col_mapping()
+                targets['clean_cas'] = targets.get(col_map['targets_cas'], pd.Series(dtype=str)).apply(clean_cas)
+                st.write(f"✓ Loaded {len(targets)} target compounds from Compounds.csv")
+                st.write(f"✓ Processing {len(f_gnps_pos) if f_gnps_pos else 0} ESI+ dataset(s)")
+                st.write(f"✓ Processing {len(f_gnps_neg) if f_gnps_neg else 0} ESI− dataset(s)")
+                st.info(f"📊 mzML files: ESI+ = {'✓ Uploaded' if f_mzml_pos else '✗ Not uploaded'}, ESI− = {'✓ Uploaded' if f_mzml_neg else '✗ Not uploaded'}")
+                
+                # Process based on selected polarity mode
+                if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                    targets_pos = run_polarity_multipe(f_gnps_pos, f_mzmine_pos, "Positive")
+                
+                if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                    targets_neg = run_polarity_multipe(f_gnps_neg, f_mzmine_neg, "Negative")
             
-            if polarity_mode in ["Positive & Negative", "Negative Only"]:
-                targets_neg = run_polarity_multipe(f_gnps_neg, f_mzmine_neg, "Negative")
+            elif st.session_state.input_mode == "Test Data":
+                st.error("Test Data mode not implemented for this update.")
+                st.stop()
             
             # Check if results are empty
             if targets_pos.empty and targets_neg.empty:
                 st.error("❌ No compounds matched between GNPS and MZmine files. Please verify your input data.")
+                st.stop()
         except ValueError as e:
             st.error(f"❌ **Data Format Error:**\n\n{str(e)}\n\n**Troubleshooting Tips:**\n- Ensure GNPS files are exported from GNPS library with all required columns\n- Ensure MZmine files are exported with the correct format\n- Check that file encoding is UTF-8 or Latin1")
         except KeyError as e:
-            st.error(f"❌ **Missing Column Error:**\n\nCannot find column: {str(e)}\n\n**Troubleshooting Tips:**\n- Verify your input files have the required columns\n- Check GNPS export settings include Compound_Name, #Scan#, CAS_Number, etc.\n- Check MZmine export includes id, mz, rt, rt_range:min, rt_range:max columns")
+            st.error(f"❌ **Missing Column Error:**\n\nCannot find column: {str(e)}\n\n**Troubleshooting Tips:**\n- Verify your input files have the required columns\n- Check GNPS export settings include Compound_Name, #Scan#, CAS_Number, etc.\n- Check MZmine export includes at minimum id, mz, rt columns (rt_range:min/rt_range:max are optional — the app falls back to apex RT if they're missing)")
         except Exception as e:
             st.error(f"❌ **Unexpected Error:**\n\n{str(e)}\n\nPlease check your input files and try again.")
             st.stop()
@@ -2220,9 +2773,8 @@ if 'results' in st.session_state:
     st.header("📊 Results & Optimization")
     
     # Info box about multiple datasets
-    st.info("""
-        **ℹ️ About your results:**
-        
+    with st.expander("ℹ️ About your results:"):
+        st.markdown("""
         If you uploaded **multiple datasets**, all results have been aggregated:
         - Each dataset was processed independently
         - For compounds found in multiple datasets, the **highest intensity** peak was selected
@@ -2230,371 +2782,391 @@ if 'results' in st.session_state:
         - No data mixing occurs — each dataset's data is processed in isolation first, then merged
         """)
     
-    st.divider()
-    
-    # Option to split into multiplex groups (post-run decision)
-    st.subheader("Multiplex Splitting Decision")
-    split_method = st.checkbox(
-        "Split into 2 Multiplex Groups?", 
-        value=st.session_state.get('split_method_selected', False),
-        help="Divides targets into two separate inclusion lists to drastically improve Points/Peak. Re-run the analysis above to apply this change.",
-        key="split_checkbox"
-    )
-    
-    # Update session state with the current checkbox value
-    if split_method != st.session_state.get('split_method_selected', False):
-        st.session_state['split_method_selected'] = split_method
-    
-    if split_method:
-        st.info("🔄 Click the **Evaluate & Optimize Method** button above to re-run the analysis with Multiplex Splitting enabled.")
-    
-    st.divider()
+    # Retrieve splitting decision from session state
+    split_method = st.session_state.get('split_method_selected', False)
     
     # Match Summary Table (Consolidated)
-    st.subheader("📋 Compound Match Summary (All Targets)")
-    st.markdown("**Complete list of all target compounds from Step 1 with match status for each ionization mode:**")
+    # Create Tabs for different results sections
+    tab_match, tab_results, tab_metrics, tab_chromatograms, tab_skyline, tab_inclusion = st.tabs([
+        "📋 Match Summary", 
+        "📊 Results Summary", 
+        "📈 Method Metrics", 
+        "🔍 Chromatograms & RT", 
+        "🎯 Skyline Mass List", 
+        "📋 Inclusion List (MS Export)"
+    ])
     
-    if 'match_summary' in r and not r['match_summary'].empty:
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            st.dataframe(r['match_summary'], width='stretch', use_container_width=True)
-        with col2:
-            total_matched = len(r['match_summary'][r['match_summary']['Match_Status'] == '✓ Matched'])
-            total_compounds = len(r['match_summary'])
-            st.metric("Total Matched", f"{total_matched}/{total_compounds}", f"{100*total_matched/total_compounds:.0f}%")
-    
-    st.divider()
-    st.subheader("📊 Results Summary")
-    
-    if r['mode'] in ["Positive & Negative", "Positive Only"] and not r['pos'].empty:
-        st.markdown("#### 📍 ESI+ (Positive)")
-        st.dataframe(r['pos'], width='stretch')
-    
-    if r['mode'] in ["Positive & Negative", "Negative Only"] and not r['neg'].empty:
-        st.markdown("#### 📍 ESI− (Negative)")
-        st.dataframe(r['neg'], width='stretch')
-    
-    st.subheader("📊 Points Per Peak Figures")
-    cols = st.columns(2) if r['mode'] == "Positive & Negative" else [st.container()]
-    
-    if r['mode'] in ["Positive & Negative", "Positive Only"] and r['fp_pos']:
-        with cols[0]:
-            st.markdown("**ESI+ Points/Peak**")
-            for grp, fig in r['fp_pos']: st.pyplot(fig)
-    
-    if r['mode'] in ["Positive & Negative", "Negative Only"] and r['fp_neg']:
-        with cols[1] if r['mode'] == "Positive & Negative" else st.container():
-            st.markdown("**ESI− Points/Peak**")
-            for grp, fig in r['fp_neg']: st.pyplot(fig)
+    with tab_match:
+        st.subheader("📋 Compound Match Summary (All Targets)")
+        st.markdown("**Complete list of all target compounds from Step 1 with match status for each ionization mode:**")
         
-    st.subheader("📈 Concurrency Density Plots")
-    cols = st.columns(2) if r['mode'] == "Positive & Negative" else [st.container()]
-    
-    if r['mode'] in ["Positive & Negative", "Positive Only"] and r['fc_pos']:
-        with cols[0]:
-            st.markdown("**ESI+ Concurrency**")
-            for grp, fig in r['fc_pos']: st.pyplot(fig)
-    
-    if r['mode'] in ["Positive & Negative", "Negative Only"] and r['fc_neg']:
-        with cols[1] if r['mode'] == "Positive & Negative" else st.container():
-            st.markdown("**ESI− Concurrency**")
-            for grp, fig in r['fc_neg']: st.pyplot(fig)
-    
-    st.subheader("⏱️ Retention Time Alignment")
-    cols = st.columns(2) if r['mode'] == "Positive & Negative" else [st.container()]
-    
-    if r['mode'] in ["Positive & Negative", "Positive Only"] and r['fig_rt_pos']:
-        with cols[0]:
-            st.markdown("**ESI+ RT Windows**")
-            # Handle both old format (single Figure) and new format (list of tuples)
-            if isinstance(r['fig_rt_pos'], list):
-                for grp, fig in r['fig_rt_pos']: st.pyplot(fig)
-            else:
-                st.pyplot(r['fig_rt_pos'])
-    
-    if r['mode'] in ["Positive & Negative", "Negative Only"] and r['fig_rt_neg']:
-        with cols[1] if r['mode'] == "Positive & Negative" else st.container():
-            st.markdown("**ESI− RT Windows**")
-            # Handle both old format (single Figure) and new format (list of tuples)
-            if isinstance(r['fig_rt_neg'], list):
-                for grp, fig in r['fig_rt_neg']: st.pyplot(fig)
-            else:
-                st.pyplot(r['fig_rt_neg'])
-    
-    st.divider()
-    
-    # m/z vs Retention Time Visualizations
-    if r.get('fig_mz_rt_2d_pos') or r.get('fig_mz_rt_2d_neg'):
-        st.subheader("📈 m/z vs Retention Time")
-        cols = st.columns(2) if r['mode'] == "Positive & Negative" and r.get('fig_mz_rt_2d_pos') and r.get('fig_mz_rt_2d_neg') else [st.container()]
+        if 'match_summary' in r and not r['match_summary'].empty:
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.dataframe(r['match_summary'], width='stretch', use_container_width=True)
+            with col2:
+                total_matched = len(r['match_summary'][r['match_summary']['Match_Status'] == '✓ Matched'])
+                total_compounds = len(r['match_summary'])
+                st.metric("Total Matched", f"{total_matched}/{total_compounds}", f"{100*total_matched/total_compounds:.0f}%")
+                
+    with tab_results:
+        st.subheader("📊 Results Summary")
         
-        if r.get('fig_mz_rt_2d_pos'):
-            with cols[0] if r['mode'] == "Positive & Negative" else st.container():
-                st.markdown("**ESI+ m/z vs RT**")
-                st.plotly_chart(r['fig_mz_rt_2d_pos'], use_container_width=True)
-        
-        if r.get('fig_mz_rt_2d_neg'):
-            with cols[1] if r['mode'] == "Positive & Negative" else st.container():
-                st.markdown("**ESI− m/z vs RT**")
-                st.plotly_chart(r['fig_mz_rt_2d_neg'], use_container_width=True)
-    
-    st.divider()
-    
-    if r.get('fig_xic_pos') or r.get('fig_xic_neg'):
-        st.subheader("🗂️ Extracted Ion Chromatograms (XICs)")
-        cols = st.columns(2) if r['mode'] == "Positive & Negative" and r.get('fig_xic_pos') and r.get('fig_xic_neg') else [st.container()]
-        
-        if r.get('fig_xic_pos'):
-            with cols[0] if r['mode'] == "Positive & Negative" else st.container():
-                st.markdown("**ESI+ XICs from LC-MS Raw Data**")
-                st.pyplot(r['fig_xic_pos'])
-        
-        if r.get('fig_xic_neg'):
-            with cols[1] if r['mode'] == "Positive & Negative" else st.container():
-                st.markdown("**ESI− XICs from LC-MS Raw Data**")
-                st.pyplot(r['fig_xic_neg'])
-    else:
-        st.info("ℹ️ No XIC figures available. Upload mzML files for chromatogram visualization.")
-    
-    st.divider()
-    
-    # Skyline Output Section
-    if not r['skyline_pos'].empty or not r['skyline_neg'].empty:
-        st.subheader("🎯 Skyline Mass List Table")
-        st.markdown("**Formatted MS/MS transitions for direct import into Skyline. Includes 2 most abundant fragments per precursor.**")
-        
-        # Skyline Match Summary Metrics
-        col1, col2 = st.columns([1, 1]) if r['mode'] == "Positive & Negative" and not r['skyline_pos'].empty and not r['skyline_neg'].empty else [st.container()]
-        
-        if not r['skyline_pos'].empty:
-            with col1 if r['mode'] == "Positive & Negative" else st.container():
-                skyline_precursors_pos = r['skyline_pos']['Precursor Name'].nunique() if 'Precursor Name' in r['skyline_pos'].columns else len(r['skyline_pos'])
-                final_pos_count = len(r['pos']) if not r['pos'].empty else 0
-                st.metric("ESI+ Matched Precursors", f"{skyline_precursors_pos}/{final_pos_count}", f"{100*skyline_precursors_pos/final_pos_count:.0f}%" if final_pos_count > 0 else "0%")
-        
-        if not r['skyline_neg'].empty:
-            with col2 if r['mode'] == "Positive & Negative" else st.container():
-                skyline_precursors_neg = r['skyline_neg']['Precursor Name'].nunique() if 'Precursor Name' in r['skyline_neg'].columns else len(r['skyline_neg'])
-                final_neg_count = len(r['neg']) if not r['neg'].empty else 0
-                st.metric("ESI− Matched Precursors", f"{skyline_precursors_neg}/{final_neg_count}", f"{100*skyline_precursors_neg/final_neg_count:.0f}%" if final_neg_count > 0 else "0%")
-        
-        if not r['skyline_pos'].empty:
+        if r['mode'] in ["Positive & Negative", "Positive Only"] and not r['pos'].empty:
             st.markdown("#### 📍 ESI+ (Positive)")
-            st.dataframe(r['skyline_pos'], width='stretch', use_container_width=True)
-            
-            # Download Skyline CSV
-            skyline_csv_pos = r['skyline_pos'].to_csv(index=False)
-            st.download_button(
-                label="⬇️ Download Skyline_Transition-List_ESI-pos",
-                data=skyline_csv_pos,
-                file_name="Skyline_Transition-List_ESI-pos.csv",
-                mime="text/csv",
-                key="download_skyline_pos"
-            )
+            st.dataframe(r['pos'], width='stretch')
         
-        if not r['skyline_neg'].empty:
+        if r['mode'] in ["Positive & Negative", "Negative Only"] and not r['neg'].empty:
             st.markdown("#### 📍 ESI− (Negative)")
-            st.dataframe(r['skyline_neg'], width='stretch', use_container_width=True)
+            st.dataframe(r['neg'], width='stretch')
             
-            # Download Skyline CSV
-            skyline_csv_neg = r['skyline_neg'].to_csv(index=False)
-            st.download_button(
-                label="⬇️ Download Skyline_Transition-List_ESI-neg",
-                data=skyline_csv_neg,
-                file_name="Skyline_Transition-List_ESI-neg.csv",
-                mime="text/csv",
-                key="download_skyline_neg"
-            )
-        
-        st.divider()
-    
-    # Inclusion List / MS Export
-    st.subheader("📋 Inclusion List for MS Acquisition")
-    st.markdown("""
-    The tables below show your final PRM targets organized by polarity and multiplex group.  
-    These compounds are ready to be imported into your mass spectrometry software (e.g., Thermo Exploris, Skyline).
-    """)
-    
-    # Check if multiplex splitting was used
-    has_multiplex = 'Multiplex_Group' in r['pos'].columns if not r['pos'].empty else 'Multiplex_Group' in r['neg'].columns if not r['neg'].empty else False
-    
-    if has_multiplex and (not r['pos'].empty or not r['neg'].empty) and split_method:
-        # MULTIPLEX MODE: Show separate groups
-        
-        # ESI+ Groups
-        if r['mode'] in ["Positive & Negative", "Positive Only"] and not r['pos'].empty:
-            st.markdown("### ESI+ (Positive Mode)")
-            pos_group1_orig = r['pos'][r['pos']['Multiplex_Group'] == 1].copy()
-            pos_group2_orig = r['pos'][r['pos']['Multiplex_Group'] == 2].copy()
+    with tab_metrics:
+        st.subheader("📊 Points Per Peak Figures")
+        if r['mode'] == "Positive & Negative" and r['fp_pos'] and r['fp_neg']:
+            ppp_cols = st.columns(2)
+            with ppp_cols[0]:
+                st.markdown("**ESI+ Points/Peak**")
+                for grp, fig in r['fp_pos']: st.pyplot(fig)
+            with ppp_cols[1]:
+                st.markdown("**ESI− Points/Peak**")
+                for grp, fig in r['fp_neg']: st.pyplot(fig)
+        else:
+            if r['mode'] in ["Positive & Negative", "Positive Only"] and r['fp_pos']:
+                st.markdown("**ESI+ Points/Peak**")
+                for grp, fig in r['fp_pos']: st.pyplot(fig)
+            if r['mode'] in ["Positive & Negative", "Negative Only"] and r['fp_neg']:
+                st.markdown("**ESI− Points/Peak**")
+                for grp, fig in r['fp_neg']: st.pyplot(fig)
             
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("#### 🔵 Group 1 (Inclusion List 1)")
-                # Interactive selector for Group 1
-                pos_group1 = build_compound_selector(pos_group1_orig, "pos_g1", "Select ESI+ Group 1 Compounds")
+        st.subheader("📈 Concurrency Density Plots")
+        if r['mode'] == "Positive & Negative" and r['fc_pos'] and r['fc_neg']:
+            conc_cols = st.columns(2)
+            with conc_cols[0]:
+                st.markdown("**ESI+ Concurrency**")
+                for grp, fig in r['fc_pos']: st.pyplot(fig)
+            with conc_cols[1]:
+                st.markdown("**ESI− Concurrency**")
+                for grp, fig in r['fc_neg']: st.pyplot(fig)
+        else:
+            if r['mode'] in ["Positive & Negative", "Positive Only"] and r['fc_pos']:
+                st.markdown("**ESI+ Concurrency**")
+                for grp, fig in r['fc_pos']: st.pyplot(fig)
+            if r['mode'] in ["Positive & Negative", "Negative Only"] and r['fc_neg']:
+                st.markdown("**ESI− Concurrency**")
+                for grp, fig in r['fc_neg']: st.pyplot(fig)
                 
-                if not pos_group1.empty:
-                    cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
-                    if 'Formula' in pos_group1.columns:
-                        cols_to_use.insert(1, 'Formula')
-                    if 'Adduct' in pos_group1.columns:
-                        cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
-                    st.dataframe(pos_group1[cols_to_use], width='stretch')
-                    
-                    # Download Group 1
-                    thermo_csv_pos_g1 = create_thermo_fisher_csv(pos_group1, r['rt_window_mode'])
-                    st.download_button(
-                        label="⬇️ Download Group 1 (Exploris Format)",
-                        data=thermo_csv_pos_g1,
-                        file_name="Exploris_Inclusion-List_ESI-pos_Group1.csv",
-                        mime="text/csv",
-                        key="download_pos_g1_thermo"
-                    )
+    with tab_chromatograms:
+        st.subheader("⏱️ Retention Time Alignment")
+        if r['mode'] == "Positive & Negative" and r['fig_rt_pos'] and r['fig_rt_neg']:
+            rt_cols = st.columns(2)
+            with rt_cols[0]:
+                st.markdown("**ESI+ RT Windows**")
+                for grp, fig in r['fig_rt_pos']: st.pyplot(fig)
+            with rt_cols[1]:
+                st.markdown("**ESI− RT Windows**")
+                for grp, fig in r['fig_rt_neg']: st.pyplot(fig)
+        else:
+            if r['mode'] in ["Positive & Negative", "Positive Only"] and r['fig_rt_pos']:
+                st.markdown("**ESI+ RT Windows**")
+                if isinstance(r['fig_rt_pos'], list):
+                    for grp, fig in r['fig_rt_pos']: st.pyplot(fig)
                 else:
-                    st.info("No targets in Group 1")
-            
-            with col2:
-                st.markdown("#### 🟠 Group 2 (Inclusion List 2)")
-                # Interactive selector for Group 2
-                pos_group2 = build_compound_selector(pos_group2_orig, "pos_g2", "Select ESI+ Group 2 Compounds")
-                
-                if not pos_group2.empty:
-                    cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
-                    if 'Formula' in pos_group2.columns:
-                        cols_to_use.insert(1, 'Formula')
-                    if 'Adduct' in pos_group2.columns:
-                        cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
-                    st.dataframe(pos_group2[cols_to_use], width='stretch')
-                    
-                    # Download Group 2
-                    thermo_csv_pos_g2 = create_thermo_fisher_csv(pos_group2, r['rt_window_mode'])
-                    st.download_button(
-                        label="⬇️ Download Group 2 (Exploris Format)",
-                        data=thermo_csv_pos_g2,
-                        file_name="Exploris_Inclusion-List_ESI-pos_Group2.csv",
-                        mime="text/csv",
-                        key="download_pos_g2_thermo"
-                    )
+                    st.pyplot(r['fig_rt_pos'])
+            if r['mode'] in ["Positive & Negative", "Negative Only"] and r['fig_rt_neg']:
+                st.markdown("**ESI− RT Windows**")
+                if isinstance(r['fig_rt_neg'], list):
+                    for grp, fig in r['fig_rt_neg']: st.pyplot(fig)
                 else:
-                    st.info("No targets in Group 2")
+                    st.pyplot(r['fig_rt_neg'])
         
         st.divider()
         
-        # ESI- Groups
-        if r['mode'] in ["Positive & Negative", "Negative Only"] and not r['neg'].empty:
-            st.markdown("### ESI− (Negative Mode)")
-            neg_group1_orig = r['neg'][r['neg']['Multiplex_Group'] == 1].copy()
-            neg_group2_orig = r['neg'][r['neg']['Multiplex_Group'] == 2].copy()
+        # m/z vs Retention Time Visualizations
+        if r.get('fig_mz_rt_2d_pos') or r.get('fig_mz_rt_2d_neg'):
+            st.subheader("📈 m/z vs Retention Time")
+            if r['mode'] == "Positive & Negative" and r.get('fig_mz_rt_2d_pos') and r.get('fig_mz_rt_2d_neg'):
+                mz_rt_cols = st.columns(2)
+                with mz_rt_cols[0]:
+                    st.markdown("**ESI+ m/z vs RT**")
+                    st.plotly_chart(r['fig_mz_rt_2d_pos'], use_container_width=True)
+                with mz_rt_cols[1]:
+                    st.markdown("**ESI− m/z vs RT**")
+                    st.plotly_chart(r['fig_mz_rt_2d_neg'], use_container_width=True)
+            else:
+                if r.get('fig_mz_rt_2d_pos'):
+                    st.markdown("**ESI+ m/z vs RT**")
+                    st.plotly_chart(r['fig_mz_rt_2d_pos'], use_container_width=True)
+                if r.get('fig_mz_rt_2d_neg'):
+                    st.markdown("**ESI− m/z vs RT**")
+                    st.plotly_chart(r['fig_mz_rt_2d_neg'], use_container_width=True)
+        
+        st.divider()
+        
+        if r.get('fig_xic_pos') or r.get('fig_xic_neg'):
+            st.subheader("🗂️ Extracted Ion Chromatograms (XICs)")
+            if r['mode'] == "Positive & Negative" and r.get('fig_xic_pos') and r.get('fig_xic_neg'):
+                xic_cols = st.columns(2)
+                with xic_cols[0]:
+                    st.markdown("**ESI+ XICs from LC-MS Raw Data**")
+                    st.pyplot(r['fig_xic_pos'])
+                with xic_cols[1]:
+                    st.markdown("**ESI− XICs from LC-MS Raw Data**")
+                    st.pyplot(r['fig_xic_neg'])
+            else:
+                if r.get('fig_xic_pos'):
+                    st.markdown("**ESI+ XICs from LC-MS Raw Data**")
+                    st.pyplot(r['fig_xic_pos'])
+                if r.get('fig_xic_neg'):
+                    st.markdown("**ESI− XICs from LC-MS Raw Data**")
+                    st.pyplot(r['fig_xic_neg'])
+        else:
+            st.info("ℹ️ No XIC figures available. Upload mzML files for chromatogram visualization.")
             
+    with tab_skyline:
+        # Skyline Output Section
+        if not r['skyline_pos'].empty or not r['skyline_neg'].empty:
+            st.subheader("🎯 Skyline Mass List Table")
+            st.markdown("**Formatted MS/MS transitions for direct import into Skyline. Includes 2 most abundant fragments per precursor.**")
+            
+            # Skyline Match Summary Metrics
+            if r['mode'] == "Positive & Negative" and not r['skyline_pos'].empty and not r['skyline_neg'].empty:
+                metrics_cols = st.columns(2)
+                with metrics_cols[0]:
+                    skyline_precursors_pos = r['skyline_pos']['Precursor Name'].nunique() if 'Precursor Name' in r['skyline_pos'].columns else len(r['skyline_pos'])
+                    final_pos_count = len(r['pos']) if not r['pos'].empty else 0
+                    st.metric("ESI+ Matched Precursors", f"{skyline_precursors_pos}/{final_pos_count}", f"{100*skyline_precursors_pos/final_pos_count:.0f}%" if final_pos_count > 0 else "0%")
+                with metrics_cols[1]:
+                    skyline_precursors_neg = r['skyline_neg']['Precursor Name'].nunique() if 'Precursor Name' in r['skyline_neg'].columns else len(r['skyline_neg'])
+                    final_neg_count = len(r['neg']) if not r['neg'].empty else 0
+                    st.metric("ESI− Matched Precursors", f"{skyline_precursors_neg}/{final_neg_count}", f"{100*skyline_precursors_neg/final_neg_count:.0f}%" if final_neg_count > 0 else "0%")
+            else:
+                if not r['skyline_pos'].empty:
+                    skyline_precursors_pos = r['skyline_pos']['Precursor Name'].nunique() if 'Precursor Name' in r['skyline_pos'].columns else len(r['skyline_pos'])
+                    final_pos_count = len(r['pos']) if not r['pos'].empty else 0
+                    st.metric("ESI+ Matched Precursors", f"{skyline_precursors_pos}/{final_pos_count}", f"{100*skyline_precursors_pos/final_pos_count:.0f}%" if final_pos_count > 0 else "0%")
+                if not r['skyline_neg'].empty:
+                    skyline_precursors_neg = r['skyline_neg']['Precursor Name'].nunique() if 'Precursor Name' in r['skyline_neg'].columns else len(r['skyline_neg'])
+                    final_neg_count = len(r['neg']) if not r['neg'].empty else 0
+                    st.metric("ESI− Matched Precursors", f"{skyline_precursors_neg}/{final_neg_count}", f"{100*skyline_precursors_neg/final_neg_count:.0f}%" if final_neg_count > 0 else "0%")
+            
+            if not r['skyline_pos'].empty:
+                st.markdown("#### 📍 ESI+ (Positive)")
+                st.dataframe(r['skyline_pos'], width='stretch', use_container_width=True)
+                
+                # Download Skyline CSV
+                skyline_csv_pos = r['skyline_pos'].to_csv(index=False)
+                st.download_button(
+                    label="⬇️ Download Skyline_Transition-List_ESI-pos",
+                    data=skyline_csv_pos,
+                    file_name="Skyline_Transition-List_ESI-pos.csv",
+                    mime="text/csv",
+                    key="download_skyline_pos"
+                )
+            
+            if not r['skyline_neg'].empty:
+                st.markdown("#### 📍 ESI− (Negative)")
+                st.dataframe(r['skyline_neg'], width='stretch', use_container_width=True)
+                
+                # Download Skyline CSV
+                skyline_csv_neg = r['skyline_neg'].to_csv(index=False)
+                st.download_button(
+                    label="⬇️ Download Skyline_Transition-List_ESI-neg",
+                    data=skyline_csv_neg,
+                    file_name="Skyline_Transition-List_ESI-neg.csv",
+                    mime="text/csv",
+                    key="download_skyline_neg"
+                )
+        else:
+            st.info("ℹ️ No Skyline Transitions generated. Enable Skyline Mass List in Step 3 and provide MGF files to generate.")
+            
+    with tab_inclusion:
+        # Inclusion List / MS Export
+        st.subheader("📋 Inclusion List for MS Acquisition")
+        st.markdown("""
+        The tables below show your final PRM targets organized by polarity and multiplex group.  
+        These compounds are ready to be imported into your mass spectrometry software (e.g., Thermo Exploris, Skyline).
+        """)
+        
+        # Check if multiplex splitting was used
+        has_multiplex = 'Multiplex_Group' in r['pos'].columns if not r['pos'].empty else 'Multiplex_Group' in r['neg'].columns if not r['neg'].empty else False
+        
+        if has_multiplex and (not r['pos'].empty or not r['neg'].empty) and split_method:
+            # MULTIPLEX MODE: Show separate groups
+            
+            # ESI+ Groups
+            if r['mode'] in ["Positive & Negative", "Positive Only"] and not r['pos'].empty:
+                st.markdown("### ESI+ (Positive Mode)")
+                pos_group1_orig = r['pos'][r['pos']['Multiplex_Group'] == 1].copy()
+                pos_group2_orig = r['pos'][r['pos']['Multiplex_Group'] == 2].copy()
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("#### 🔵 Group 1 (Inclusion List 1)")
+                    # Interactive selector for Group 1
+                    pos_group1 = build_compound_selector(pos_group1_orig, "pos_g1", "Select ESI+ Group 1 Compounds")
+                    
+                    if not pos_group1.empty:
+                        cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
+                        if 'Formula' in pos_group1.columns:
+                            cols_to_use.insert(1, 'Formula')
+                        if 'Adduct' in pos_group1.columns:
+                            cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
+                        st.dataframe(pos_group1[cols_to_use], width='stretch')
+                        
+                        # Download Group 1
+                        thermo_csv_pos_g1 = create_thermo_fisher_csv(pos_group1, r['rt_window_mode'])
+                        st.download_button(
+                            label="⬇️ Download Group 1 (Exploris Format)",
+                            data=thermo_csv_pos_g1,
+                            file_name="Exploris_Inclusion-List_ESI-pos_Group1.csv",
+                            mime="text/csv",
+                            key="download_pos_g1_thermo"
+                        )
+                    else:
+                        st.info("No targets in Group 1")
+                
+                with col2:
+                    st.markdown("#### 🟠 Group 2 (Inclusion List 2)")
+                    # Interactive selector for Group 2
+                    pos_group2 = build_compound_selector(pos_group2_orig, "pos_g2", "Select ESI+ Group 2 Compounds")
+                    
+                    if not pos_group2.empty:
+                        cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
+                        if 'Formula' in pos_group2.columns:
+                            cols_to_use.insert(1, 'Formula')
+                        if 'Adduct' in pos_group2.columns:
+                            cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
+                        st.dataframe(pos_group2[cols_to_use], width='stretch')
+                        
+                        # Download Group 2
+                        thermo_csv_pos_g2 = create_thermo_fisher_csv(pos_group2, r['rt_window_mode'])
+                        st.download_button(
+                            label="⬇️ Download Group 2 (Exploris Format)",
+                            data=thermo_csv_pos_g2,
+                            file_name="Exploris_Inclusion-List_ESI-pos_Group2.csv",
+                            mime="text/csv",
+                            key="download_pos_g2_thermo"
+                        )
+                    else:
+                        st.info("No targets in Group 2")
+            
+            st.divider()
+            
+            # ESI- Groups
+            if r['mode'] in ["Positive & Negative", "Negative Only"] and not r['neg'].empty:
+                st.markdown("### ESI− (Negative Mode)")
+                neg_group1_orig = r['neg'][r['neg']['Multiplex_Group'] == 1].copy()
+                neg_group2_orig = r['neg'][r['neg']['Multiplex_Group'] == 2].copy()
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("#### 🔵 Group 1 (Inclusion List 1)")
+                    # Interactive selector for Group 1
+                    neg_group1 = build_compound_selector(neg_group1_orig, "neg_g1", "Select ESI− Group 1 Compounds")
+                    
+                    if not neg_group1.empty:
+                        cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
+                        if 'Formula' in neg_group1.columns:
+                            cols_to_use.insert(1, 'Formula')
+                        if 'Adduct' in neg_group1.columns:
+                            cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
+                        st.dataframe(neg_group1[cols_to_use], width='stretch')
+                        
+                        # Download Group 1
+                        thermo_csv_neg_g1 = create_thermo_fisher_csv(neg_group1, r['rt_window_mode'])
+                        st.download_button(
+                            label="⬇️ Download Group 1 (Exploris Format)",
+                            data=thermo_csv_neg_g1,
+                            file_name="Exploris_Inclusion-List_ESI-neg_Group1.csv",
+                            mime="text/csv",
+                            key="download_neg_g1_thermo"
+                        )
+                    else:
+                        st.info("No targets in Group 1")
+                
+                with col2:
+                    st.markdown("#### 🟠 Group 2 (Inclusion List 2)")
+                    # Interactive selector for Group 2
+                    neg_group2 = build_compound_selector(neg_group2_orig, "neg_g2", "Select ESI− Group 2 Compounds")
+                    
+                    if not neg_group2.empty:
+                        cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
+                        if 'Formula' in neg_group2.columns:
+                            cols_to_use.insert(1, 'Formula')
+                        if 'Adduct' in neg_group2.columns:
+                            cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
+                        st.dataframe(neg_group2[cols_to_use], width='stretch')
+                        
+                        # Download Group 2
+                        thermo_csv_neg_g2 = create_thermo_fisher_csv(neg_group2, r['rt_window_mode'])
+                        st.download_button(
+                            label="⬇️ Download Group 2 (Exploris Format)",
+                            data=thermo_csv_neg_g2,
+                            file_name="Exploris_Inclusion-List_ESI-neg_Group2.csv",
+                            mime="text/csv",
+                            key="download_neg_g2_thermo"
+                        )
+                    else:
+                        st.info("No targets in Group 2")
+        else:
+            # NON-MULTIPLEX MODE: Show combined lists
             col1, col2 = st.columns(2)
             
-            with col1:
-                st.markdown("#### 🔵 Group 1 (Inclusion List 1)")
-                # Interactive selector for Group 1
-                neg_group1 = build_compound_selector(neg_group1_orig, "neg_g1", "Select ESI− Group 1 Compounds")
-                
-                if not neg_group1.empty:
-                    cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
-                    if 'Formula' in neg_group1.columns:
-                        cols_to_use.insert(1, 'Formula')
-                    if 'Adduct' in neg_group1.columns:
-                        cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
-                    st.dataframe(neg_group1[cols_to_use], width='stretch')
+            if r['mode'] in ["Positive & Negative", "Positive Only"] and not r['pos'].empty:
+                with col1:
+                    st.markdown("#### ESI+ Inclusion List")
+                    # Interactive selector for positive
+                    pos_filtered = build_compound_selector(r['pos'], "pos_single", "Select ESI+ Compounds")
                     
-                    # Download Group 1
-                    thermo_csv_neg_g1 = create_thermo_fisher_csv(neg_group1, r['rt_window_mode'])
-                    st.download_button(
-                        label="⬇️ Download Group 1 (Exploris Format)",
-                        data=thermo_csv_neg_g1,
-                        file_name="Exploris_Inclusion-List_ESI-neg_Group1.csv",
-                        mime="text/csv",
-                        key="download_neg_g1_thermo"
-                    )
-                else:
-                    st.info("No targets in Group 1")
+                    if not pos_filtered.empty:
+                        cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
+                        # Add Formula and Adduct if they exist
+                        if 'Formula' in pos_filtered.columns:
+                            cols_to_use.insert(1, 'Formula')
+                        if 'Adduct' in pos_filtered.columns:
+                            cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
+                        st.dataframe(pos_filtered[cols_to_use], width='stretch')
+                        
+                        # Thermo Fisher format download
+                        thermo_csv_pos = create_thermo_fisher_csv(pos_filtered, r['rt_window_mode'])
+                        st.download_button(
+                            label="⬇️ Download ESI+ (Exploris Format)",
+                            data=thermo_csv_pos,
+                            file_name="Exploris_Inclusion-List_ESI-pos.csv",
+                            mime="text/csv",
+                            key="download_pos_thermo"
+                        )
+                    else:
+                        st.info("No compounds selected for ESI+")
             
-            with col2:
-                st.markdown("#### 🟠 Group 2 (Inclusion List 2)")
-                # Interactive selector for Group 2
-                neg_group2 = build_compound_selector(neg_group2_orig, "neg_g2", "Select ESI− Group 2 Compounds")
-                
-                if not neg_group2.empty:
-                    cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
-                    if 'Formula' in neg_group2.columns:
-                        cols_to_use.insert(1, 'Formula')
-                    if 'Adduct' in neg_group2.columns:
-                        cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
-                    st.dataframe(neg_group2[cols_to_use], width='stretch')
+            if r['mode'] in ["Positive & Negative", "Negative Only"] and not r['neg'].empty:
+                with col2 if r['mode'] == "Positive & Negative" else st.container():
+                    st.markdown("#### ESI− Inclusion List")
+                    # Interactive selector for negative
+                    neg_filtered = build_compound_selector(r['neg'], "neg_single", "Select ESI− Compounds")
                     
-                    # Download Group 2
-                    thermo_csv_neg_g2 = create_thermo_fisher_csv(neg_group2, r['rt_window_mode'])
-                    st.download_button(
-                        label="⬇️ Download Group 2 (Exploris Format)",
-                        data=thermo_csv_neg_g2,
-                        file_name="Exploris_Inclusion-List_ESI-neg_Group2.csv",
-                        mime="text/csv",
-                        key="download_neg_g2_thermo"
-                    )
-                else:
-                    st.info("No targets in Group 2")
-    else:
-        # NON-MULTIPLEX MODE: Show combined lists
-        col1, col2 = st.columns(2)
-        
-        if r['mode'] in ["Positive & Negative", "Positive Only"] and not r['pos'].empty:
-            with col1:
-                st.markdown("#### ESI+ Inclusion List")
-                # Interactive selector for positive
-                pos_filtered = build_compound_selector(r['pos'], "pos_single", "Select ESI+ Compounds")
-                
-                if not pos_filtered.empty:
-                    cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
-                    # Add Formula and Adduct if they exist
-                    if 'Formula' in pos_filtered.columns:
-                        cols_to_use.insert(1, 'Formula')
-                    if 'Adduct' in pos_filtered.columns:
-                        cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
-                    st.dataframe(pos_filtered[cols_to_use], width='stretch')
-                    
-                    # Thermo Fisher format download
-                    thermo_csv_pos = create_thermo_fisher_csv(pos_filtered, r['rt_window_mode'])
-                    st.download_button(
-                        label="⬇️ Download ESI+ (Exploris Format)",
-                        data=thermo_csv_pos,
-                        file_name="Exploris_Inclusion-List_ESI-pos.csv",
-                        mime="text/csv",
-                        key="download_pos_thermo"
-                    )
-                else:
-                    st.info("No compounds selected for ESI+")
-        
-        if r['mode'] in ["Positive & Negative", "Negative Only"] and not r['neg'].empty:
-            with col2 if r['mode'] == "Positive & Negative" else st.container():
-                st.markdown("#### ESI− Inclusion List")
-                # Interactive selector for negative
-                neg_filtered = build_compound_selector(r['neg'], "neg_single", "Select ESI− Compounds")
-                
-                if not neg_filtered.empty:
-                    cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
-                    # Add Formula and Adduct if they exist
-                    if 'Formula' in neg_filtered.columns:
-                        cols_to_use.insert(1, 'Formula')
-                    if 'Adduct' in neg_filtered.columns:
-                        cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
-                    st.dataframe(neg_filtered[cols_to_use], width='stretch')
-                    
-                    # Thermo Fisher format download
-                    thermo_csv_neg = create_thermo_fisher_csv(neg_filtered, r['rt_window_mode'])
-                    st.download_button(
-                        label="⬇️ Download ESI− (Exploris Format)",
-                        data=thermo_csv_neg,
-                        file_name="Exploris_Inclusion-List_ESI-neg.csv",
-                        mime="text/csv",
-                        key="download_neg_thermo"
-                    )
-                else:
-                    st.info("No compounds selected for ESI−")
+                    if not neg_filtered.empty:
+                        cols_to_use = ['Compound', 'm/z', 'z', 't start (min)', 't stop (min)']
+                        # Add Formula and Adduct if they exist
+                        if 'Formula' in neg_filtered.columns:
+                            cols_to_use.insert(1, 'Formula')
+                        if 'Adduct' in neg_filtered.columns:
+                            cols_to_use.insert(2 if 'Formula' in cols_to_use else 1, 'Adduct')
+                        st.dataframe(neg_filtered[cols_to_use], width='stretch')
+                        
+                        # Thermo Fisher format download
+                        thermo_csv_neg = create_thermo_fisher_csv(neg_filtered, r['rt_window_mode'])
+                        st.download_button(
+                            label="⬇️ Download ESI− (Exploris Format)",
+                            data=thermo_csv_neg,
+                            file_name="Exploris_Inclusion-List_ESI-neg.csv",
+                            mime="text/csv",
+                            key="download_neg_thermo"
+                        )
+                    else:
+                        st.info("No compounds selected for ESI−")
     
     st.divider()
     
