@@ -45,6 +45,74 @@ TARGETS_SMILES_COL = "SMILES"
 TARGETS_FORMULA_COL = "Formula"
 
 # =============================================================================
+# COLUMN MAPPING HELPER
+# =============================================================================
+def get_col_mapping():
+    """Get current column mappings from session state or use defaults"""
+    import streamlit as st
+    
+    mapping = {
+        'gnps_compound': st.session_state.get('col_gnps_compound', GNPS_COMPOUND_COL),
+        'gnps_scan': st.session_state.get('col_gnps_scan', GNPS_SCAN_COL),
+        'gnps_formula': st.session_state.get('col_gnps_formula', GNPS_FORMULA_COL),
+        'gnps_adduct': st.session_state.get('col_gnps_adduct', GNPS_ADDUCT_COL),
+        'gnps_cas': st.session_state.get('col_gnps_cas', GNPS_CAS_COL),
+        'gnps_smiles': st.session_state.get('col_gnps_smiles', GNPS_SMILES_COL),
+        'mzmine_scan': st.session_state.get('col_mzmine_scan', MZMINE_SCAN_COL),
+        'mzmine_mz': st.session_state.get('col_mzmine_mz', MZMINE_MZ_COL),
+        'mzmine_rt': st.session_state.get('col_mzmine_rt', MZMINE_RT_COL),
+        'mzmine_rt_start': st.session_state.get('col_mzmine_rt_start', MZMINE_RT_START_COL),
+        'mzmine_rt_end': st.session_state.get('col_mzmine_rt_end', MZMINE_RT_END_COL),
+        'mzmine_height': st.session_state.get('col_mzmine_height', MZMINE_HEIGHT_COL),
+        'mzmine_charge': st.session_state.get('col_mzmine_charge', MZMINE_CHARGE_COL),
+        'targets_compound': st.session_state.get('col_targets_compound', TARGETS_COMPOUND_COL),
+        'targets_cas': st.session_state.get('col_targets_cas', TARGETS_CAS_COL),
+        'targets_smiles': st.session_state.get('col_targets_smiles', TARGETS_SMILES_COL),
+        'targets_formula': st.session_state.get('col_targets_formula', TARGETS_FORMULA_COL),
+    }
+    return mapping
+
+def find_column_ci(df, col_name):
+    """
+    Find a column in a dataframe case-insensitively.
+    Returns the actual column name if found, otherwise returns the original col_name.
+    """
+    if col_name in df.columns:
+        return col_name
+    
+    col_name_lower = col_name.lower()
+    for actual_col in df.columns:
+        if actual_col.lower() == col_name_lower:
+            return actual_col
+    
+    return col_name  # Return original if not found
+
+def validate_columns_ci(df, required_cols, df_name="dataframe"):
+    """
+    Validate required columns exist (case-insensitive).
+    Returns a dict mapping user-specified names to actual column names in the dataframe.
+    Raises ValueError if any required columns are missing.
+    """
+    col_mapping = {}
+    missing_cols = []
+    
+    for col_name in required_cols:
+        actual_col = find_column_ci(df, col_name)
+        if actual_col not in df.columns:
+            missing_cols.append(col_name)
+        else:
+            col_mapping[col_name] = actual_col
+    
+    if missing_cols:
+        raise ValueError(
+            f"Required column(s) {missing_cols} not found in {df_name}.\n"
+            f"Available columns: {', '.join(df.columns.tolist())}\n"
+            f"Please ensure your file has the required columns: {', '.join(required_cols)}"
+        )
+    
+    return col_mapping
+
+# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
 
@@ -62,8 +130,8 @@ def create_thermo_fisher_csv(df, rt_window_mode='composite_margin'):
     # Base columns always present
     thermo_df_dict = {
         'Compound': df['Compound'],
-        'Formula': '',
-        'Adduct': '',
+        'Formula': df.get('Formula', ''),
+        'Adduct': df.get('Adduct', ''),
         'm/z': df['m/z'].round(4),
         'z': df['z'],
     }
@@ -887,14 +955,14 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
     
     return result_df
 
-def create_compound_match_summary(all_targets_df, matched_compounds_set, polarity_mode):
+def create_compound_match_summary(all_targets_df, matched_compounds_set, polarity_mode, col_targets_compound=TARGETS_COMPOUND_COL):
     """
     Creates a summary table of all target compounds with matched/unmatched status.
     """
     summary_data = []
     
     for _, target in all_targets_df.iterrows():
-        compound_name = target.get('Compound', target.get(TARGETS_COMPOUND_COL, ''))
+        compound_name = target.get('Compound', target.get(col_targets_compound, ''))
         
         if compound_name in matched_compounds_set:
             status = "✓ Matched"
@@ -989,23 +1057,58 @@ def calculate_rt_window(peak_rt, composite_rt_min, composite_rt_max, rt_window_m
 
 def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
                      rt_window_mode="composite_margin", rt_margin_min=1.0, rt_margin_pct=None, 
-                     expected_peak_width_sec=10):
+                     expected_peak_width_sec=10,
+                     col_gnps_compound=GNPS_COMPOUND_COL, col_gnps_scan=GNPS_SCAN_COL,
+                     col_gnps_cas=GNPS_CAS_COL, col_gnps_smiles=GNPS_SMILES_COL, col_gnps_formula=GNPS_FORMULA_COL,
+                     col_gnps_adduct=GNPS_ADDUCT_COL,
+                     col_mzmine_scan=MZMINE_SCAN_COL, col_mzmine_mz=MZMINE_MZ_COL, col_mzmine_rt=MZMINE_RT_COL,
+                     col_mzmine_rt_start=MZMINE_RT_START_COL, col_mzmine_rt_end=MZMINE_RT_END_COL,
+                     col_mzmine_height=MZMINE_HEIGHT_COL, col_mzmine_charge=MZMINE_CHARGE_COL,
+                     col_targets_compound=TARGETS_COMPOUND_COL, col_targets_cas=TARGETS_CAS_COL,
+                     col_targets_smiles=TARGETS_SMILES_COL, col_targets_formula=TARGETS_FORMULA_COL):
     gnps_df = gnps_df.copy()
-    gnps_df['clean_cas'] = gnps_df.get(GNPS_CAS_COL, pd.Series(dtype=str)).apply(clean_cas)
-    gnps_df['clean_smiles'] = gnps_df.get(GNPS_SMILES_COL, pd.Series(dtype=str)).apply(lambda s: "" if pd.isna(s) else str(s).strip())
-    gnps_df['clean_formula'] = gnps_df.get(GNPS_FORMULA_COL, pd.Series(dtype=str)).apply(lambda f: "" if pd.isna(f) else str(f).replace(" ", "").lower())
+    
+    # Validate and map GNPS columns (case-insensitive)
+    required_gnps_cols = [col_gnps_compound, col_gnps_scan]
+    gnps_col_map = validate_columns_ci(gnps_df, required_gnps_cols, "GNPS data")
+    
+    # Map to actual column names in the dataframe
+    col_gnps_compound = gnps_col_map[col_gnps_compound]
+    col_gnps_scan = gnps_col_map[col_gnps_scan]
+    col_gnps_cas = find_column_ci(gnps_df, col_gnps_cas)
+    col_gnps_smiles = find_column_ci(gnps_df, col_gnps_smiles)
+    col_gnps_formula = find_column_ci(gnps_df, col_gnps_formula)
+    # Map adduct column - use temp var to avoid shadowing parameter
+    _col_gnps_adduct = find_column_ci(gnps_df, col_gnps_adduct)
+    
+    # Validate and map targets columns (case-insensitive)
+    required_targets_cols = [col_targets_compound]
+    targets_col_map = validate_columns_ci(targets_df, required_targets_cols, "Targets data")
+    col_targets_compound = targets_col_map[col_targets_compound]
+    col_targets_cas = find_column_ci(targets_df, col_targets_cas)
+    col_targets_smiles = find_column_ci(targets_df, col_targets_smiles)
+    col_targets_formula = find_column_ci(targets_df, col_targets_formula)
+    
+    
+    gnps_df['clean_cas'] = gnps_df.get(col_gnps_cas, pd.Series(dtype=str)).apply(clean_cas)
+    gnps_df['clean_smiles'] = gnps_df.get(col_gnps_smiles, pd.Series(dtype=str)).apply(lambda s: "" if pd.isna(s) else str(s).strip())
+    gnps_df['clean_formula'] = gnps_df.get(col_gnps_formula, pd.Series(dtype=str)).apply(lambda f: "" if pd.isna(f) else str(f).replace(" ", "").lower())
+
+    targets_df['clean_cas'] = targets_df.get(col_targets_cas, pd.Series(dtype=str)).apply(clean_cas)
+    targets_df['clean_smiles'] = targets_df.get(col_targets_smiles, pd.Series(dtype=str)).apply(lambda s: "" if pd.isna(s) else str(s).strip())
+    targets_df['clean_formula'] = targets_df.get(col_targets_formula, pd.Series(dtype=str)).apply(lambda f: "" if pd.isna(f) else str(f).replace(" ", "").lower())
 
     matched_rows = []
     for _, target in targets_df.iterrows():
         t_cas     = target.get('clean_cas', "")
-        t_name    = target[TARGETS_COMPOUND_COL]
+        t_name    = target[col_targets_compound]
         t_core    = get_core_name(t_name)
-        t_smiles  = str(target.get(TARGETS_SMILES_COL, "")).strip() if not pd.isna(target.get(TARGETS_SMILES_COL)) else ""
-        t_formula = str(target.get(TARGETS_FORMULA_COL, "")).replace(" ", "").lower() if not pd.isna(target.get(TARGETS_FORMULA_COL)) else ""
+        t_smiles  = str(target.get(col_targets_smiles, "")).strip() if not pd.isna(target.get(col_targets_smiles)) else ""
+        t_formula = str(target.get(col_targets_formula, "")).replace(" ", "").lower() if not pd.isna(target.get(col_targets_formula)) else ""
 
         match_cond = gnps_df.apply(
             lambda row: (t_cas != "" and row['clean_cas'] == t_cas) or
-                        (t_core != "" and t_core == get_core_name(row[GNPS_COMPOUND_COL])) or
+                        (t_core != "" and t_core == get_core_name(row[col_gnps_compound])) or
                         (t_smiles != "" and row['clean_smiles'] != "" and row['clean_smiles'] == t_smiles) or
                         (t_formula != "" and row['clean_formula'] != "" and row['clean_formula'] == t_formula),
             axis=1
@@ -1013,24 +1116,38 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
         hits = gnps_df[match_cond].copy()
         if not hits.empty:
             hits['Standardized_Compound'] = t_name
-            hits['Matched_GNPS_Name'] = hits[GNPS_COMPOUND_COL]
+            hits['Matched_GNPS_Name'] = hits[col_gnps_compound]
             matched_rows.append(hits)
 
     if not matched_rows: return pd.DataFrame()
 
     matched_gnps = pd.concat(matched_rows, ignore_index=True)
-    merged = pd.merge(matched_gnps, mzmine_df, left_on=GNPS_SCAN_COL, right_on=MZMINE_SCAN_COL, how='inner')
-    if MZMINE_HEIGHT_COL in merged.columns:
-        merged[MZMINE_HEIGHT_COL] = pd.to_numeric(merged[MZMINE_HEIGHT_COL], errors='coerce').fillna(0)
+    
+    # Validate and map MZmine columns (case-insensitive)
+    required_mzmine_cols = [col_mzmine_scan, col_mzmine_mz, col_mzmine_rt, col_mzmine_rt_start, col_mzmine_rt_end]
+    mzmine_col_map = validate_columns_ci(mzmine_df, required_mzmine_cols, "MZmine data")
+    
+    # Map to actual column names in the dataframe
+    col_mzmine_scan = mzmine_col_map[col_mzmine_scan]
+    col_mzmine_mz = mzmine_col_map[col_mzmine_mz]
+    col_mzmine_rt = mzmine_col_map[col_mzmine_rt]
+    col_mzmine_rt_start = mzmine_col_map[col_mzmine_rt_start]
+    col_mzmine_rt_end = mzmine_col_map[col_mzmine_rt_end]
+    col_mzmine_height = find_column_ci(mzmine_df, col_mzmine_height)
+    col_mzmine_charge = find_column_ci(mzmine_df, col_mzmine_charge)
+    
+    merged = pd.merge(matched_gnps, mzmine_df, left_on=col_gnps_scan, right_on=col_mzmine_scan, how='inner')
+    if col_mzmine_height in merged.columns:
+        merged[col_mzmine_height] = pd.to_numeric(merged[col_mzmine_height], errors='coerce').fillna(0)
 
     results = []
     for compound_name, group in merged.groupby('Standardized_Compound'):
-        best_idx = group[MZMINE_HEIGHT_COL].idxmax()
+        best_idx = group[col_mzmine_height].idxmax()
         best_row = group.loc[best_idx]
 
-        peak_rt = best_row[MZMINE_RT_COL]
-        composite_rt_min = group[MZMINE_RT_START_COL].min()
-        composite_rt_max = group[MZMINE_RT_END_COL].max()
+        peak_rt = best_row[col_mzmine_rt]
+        composite_rt_min = group[col_mzmine_rt_start].min()
+        composite_rt_max = group[col_mzmine_rt_end].max()
         
         # Calculate RT window based on selected mode
         t_start, t_stop, exp_peak_width_sec = calculate_rt_window(
@@ -1041,16 +1158,16 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
         c_name = str(compound_name)
         result_row = {
             'Compound': c_name[:1].upper() + c_name[1:] if c_name else "",
-            'Formula': best_row.get(GNPS_FORMULA_COL, ""),
+            'Formula': best_row.get(col_gnps_formula, ""),
             'Polarity': polarity,
-            'Adduct': best_row.get(GNPS_ADDUCT_COL, ""),
-            'm/z': best_row[MZMINE_MZ_COL],
-            'z': best_row.get(MZMINE_CHARGE_COL, 1 if polarity == "Positive" else -1),
+            'Adduct': best_row.get(_col_gnps_adduct, ""),
+            'm/z': best_row[col_mzmine_mz],
+            'z': best_row.get(col_mzmine_charge, 1 if polarity == "Positive" else -1),
             'Peak_RT': peak_rt,
             'Exp_Peak_Width_sec': exp_peak_width_sec,
-            'Height': best_row[MZMINE_HEIGHT_COL],
+            'Height': best_row[col_mzmine_height],
             'Matched_GNPS_Name': best_row['Matched_GNPS_Name'],
-            'Matched_Scan': best_row[GNPS_SCAN_COL],
+            'Matched_Scan': best_row[col_gnps_scan],
             'HCD Collision Energies (%)': hcd_energies,
             'Match_Status': '✓ Matched',
             'RT_Window_Mode': rt_window_mode
@@ -1522,14 +1639,76 @@ with st.sidebar:
 
     st.divider()
     with st.expander("🔧 Advanced: Column Mappings"):
-        st.markdown("Edit default column names if your files use different naming conventions:")
+        st.markdown("**Customize column names** if your files use different naming conventions:")
+        st.info("⚠️ Ensure your column names match exactly. Leave blank to skip optional columns.")
+        
+        # Initialize session state with defaults
+        if "col_gnps_compound" not in st.session_state:
+            st.session_state.col_gnps_compound = GNPS_COMPOUND_COL
+        if "col_gnps_scan" not in st.session_state:
+            st.session_state.col_gnps_scan = GNPS_SCAN_COL
+        if "col_gnps_formula" not in st.session_state:
+            st.session_state.col_gnps_formula = GNPS_FORMULA_COL
+        if "col_gnps_adduct" not in st.session_state:
+            st.session_state.col_gnps_adduct = GNPS_ADDUCT_COL
+        if "col_gnps_cas" not in st.session_state:
+            st.session_state.col_gnps_cas = GNPS_CAS_COL
+        if "col_gnps_smiles" not in st.session_state:
+            st.session_state.col_gnps_smiles = GNPS_SMILES_COL
+        if "col_mzmine_scan" not in st.session_state:
+            st.session_state.col_mzmine_scan = MZMINE_SCAN_COL
+        if "col_mzmine_mz" not in st.session_state:
+            st.session_state.col_mzmine_mz = MZMINE_MZ_COL
+        if "col_mzmine_rt" not in st.session_state:
+            st.session_state.col_mzmine_rt = MZMINE_RT_COL
+        if "col_mzmine_rt_start" not in st.session_state:
+            st.session_state.col_mzmine_rt_start = MZMINE_RT_START_COL
+        if "col_mzmine_rt_end" not in st.session_state:
+            st.session_state.col_mzmine_rt_end = MZMINE_RT_END_COL
+        if "col_mzmine_height" not in st.session_state:
+            st.session_state.col_mzmine_height = MZMINE_HEIGHT_COL
+        if "col_mzmine_charge" not in st.session_state:
+            st.session_state.col_mzmine_charge = MZMINE_CHARGE_COL
+        if "col_targets_compound" not in st.session_state:
+            st.session_state.col_targets_compound = TARGETS_COMPOUND_COL
+        if "col_targets_cas" not in st.session_state:
+            st.session_state.col_targets_cas = TARGETS_CAS_COL
+        if "col_targets_smiles" not in st.session_state:
+            st.session_state.col_targets_smiles = TARGETS_SMILES_COL
+        if "col_targets_formula" not in st.session_state:
+            st.session_state.col_targets_formula = TARGETS_FORMULA_COL
+        
+        st.markdown("**GNPS Columns (Required)**")
         col1, col2 = st.columns(2)
         with col1:
-            st.text_input("GNPS Compound Name", value=GNPS_COMPOUND_COL, disabled=True, help="GNPS column for compound names")
-            st.text_input("GNPS Scan ID", value=GNPS_SCAN_COL, disabled=True, help="GNPS column for scan numbers")
+            st.session_state.col_gnps_compound = st.text_input("GNPS Compound Name", value=st.session_state.col_gnps_compound, key="input_gnps_compound", help="Column for compound names")
+            st.session_state.col_gnps_formula = st.text_input("GNPS Formula", value=st.session_state.col_gnps_formula, key="input_gnps_formula", help="Column for molecular formula")
+            st.session_state.col_gnps_cas = st.text_input("GNPS CAS Number", value=st.session_state.col_gnps_cas, key="input_gnps_cas", help="Optional: Column for CAS numbers")
         with col2:
-            st.text_input("MZmine m/z", value=MZMINE_MZ_COL, disabled=True, help="MZmine column for m/z values")
-            st.text_input("MZmine RT", value=MZMINE_RT_COL, disabled=True, help="MZmine column for retention time")
+            st.session_state.col_gnps_scan = st.text_input("GNPS Scan ID", value=st.session_state.col_gnps_scan, key="input_gnps_scan", help="Column for scan numbers")
+            st.session_state.col_gnps_adduct = st.text_input("GNPS Adduct", value=st.session_state.col_gnps_adduct, key="input_gnps_adduct", help="Column for adduct info")
+            st.session_state.col_gnps_smiles = st.text_input("GNPS SMILES", value=st.session_state.col_gnps_smiles, key="input_gnps_smiles", help="Optional: Column for SMILES")
+        
+        st.markdown("**MZmine Columns (Required)**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.col_mzmine_mz = st.text_input("MZmine m/z", value=st.session_state.col_mzmine_mz, key="input_mzmine_mz", help="Column for m/z values")
+            st.session_state.col_mzmine_rt = st.text_input("MZmine RT (peak)", value=st.session_state.col_mzmine_rt, key="input_mzmine_rt", help="Column for peak retention time")
+            st.session_state.col_mzmine_height = st.text_input("MZmine Height", value=st.session_state.col_mzmine_height, key="input_mzmine_height", help="Column for peak height/intensity")
+        with col2:
+            st.session_state.col_mzmine_scan = st.text_input("MZmine Scan ID", value=st.session_state.col_mzmine_scan, key="input_mzmine_scan", help="Column for scan/feature ID")
+            st.session_state.col_mzmine_rt_start = st.text_input("MZmine RT Start", value=st.session_state.col_mzmine_rt_start, key="input_mzmine_rt_start", help="Column for peak start time")
+            st.session_state.col_mzmine_rt_end = st.text_input("MZmine RT End", value=st.session_state.col_mzmine_rt_end, key="input_mzmine_rt_end", help="Column for peak end time")
+            st.session_state.col_mzmine_charge = st.text_input("MZmine Charge", value=st.session_state.col_mzmine_charge, key="input_mzmine_charge", help="Column for charge state")
+        
+        st.markdown("**Target Compounds Columns**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.col_targets_compound = st.text_input("Target Compound Name", value=st.session_state.col_targets_compound, key="input_targets_compound", help="Column for compound names")
+            st.session_state.col_targets_cas = st.text_input("Target CAS", value=st.session_state.col_targets_cas, key="input_targets_cas", help="Optional: Column for CAS numbers")
+        with col2:
+            st.session_state.col_targets_smiles = st.text_input("Target SMILES", value=st.session_state.col_targets_smiles, key="input_targets_smiles", help="Optional: Column for SMILES")
+            st.session_state.col_targets_formula = st.text_input("Target Formula", value=st.session_state.col_targets_formula, key="input_targets_formula", help="Optional: Column for formula")
 
 st.title("🔬 GNPS2-Quant Method Optimizer")
 st.markdown("Optimize Points-Per-Peak prior to exporting your Thermo Exploris 480 Inclusion Lists.")
@@ -1653,51 +1832,81 @@ st.divider()
 
 if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_ready):
     with st.status("Evaluating Method Constraints...", expanded=True) as status:
-        
-        # 1. Load Targets
-        if f_compounds:
-            targets = pd.read_csv(f_compounds, encoding='latin1')
-            targets['clean_cas'] = targets.get('CAS', pd.Series(dtype=str)).apply(clean_cas)
-        else:
-            all_compounds = set()
-            for f in (f_gnps_pos + f_gnps_neg):
-                f.seek(0); temp_df = pd.read_csv(f, encoding='latin1')
-                if 'Compound_Name' in temp_df.columns: all_compounds.update(temp_df['Compound_Name'].dropna().unique())
-            targets = pd.DataFrame({'Compound': list(all_compounds)})
-            targets['clean_cas'] = ""
-            
-        # 2. Process
-        def run_polarity_multipe(g_files, m_files, pol):
-            all_res = []
-            for g, m in zip(sorted(g_files, key=lambda x: x.name), sorted(m_files, key=lambda x: x.name)):
-                g.seek(0); m.seek(0)
-                res = process_polarity(pd.read_csv(g, encoding='latin1'), pd.read_csv(m, encoding='latin1'), pol, targets, "25,35,45", 
-                                      rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min)
-                if not res.empty: all_res.append(res)
-            return pd.concat(all_res, ignore_index=True) if all_res else pd.DataFrame()
+        try:
+            # 1. Load Targets
+            if f_compounds:
+                targets = pd.read_csv(f_compounds, encoding='latin1')
+                targets['clean_cas'] = targets.get('CAS', pd.Series(dtype=str)).apply(clean_cas)
+            else:
+                all_compounds = set()
+                for f in (f_gnps_pos + f_gnps_neg):
+                    f.seek(0); temp_df = pd.read_csv(f, encoding='latin1')
+                    if 'Compound_Name' in temp_df.columns: all_compounds.update(temp_df['Compound_Name'].dropna().unique())
+                targets = pd.DataFrame({'Compound': list(all_compounds)})
+                targets['clean_cas'] = ""
+                
+            # 2. Process
+            def run_polarity_multipe(g_files, m_files, pol):
+                all_res = []
+                # Get custom column mappings from session state
+                col_map = get_col_mapping()
+                for g, m in zip(sorted(g_files, key=lambda x: x.name), sorted(m_files, key=lambda x: x.name)):
+                    g.seek(0); m.seek(0)
+                    res = process_polarity(
+                        pd.read_csv(g, encoding='latin1'), 
+                        pd.read_csv(m, encoding='latin1'), 
+                        pol, targets, "25,35,45", 
+                        rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min,
+                        col_gnps_compound=col_map['gnps_compound'],
+                        col_gnps_scan=col_map['gnps_scan'],
+                        col_gnps_cas=col_map['gnps_cas'],
+                        col_gnps_smiles=col_map['gnps_smiles'],
+                        col_gnps_formula=col_map['gnps_formula'],
+                        col_gnps_adduct=col_map['gnps_adduct'],
+                        col_mzmine_scan=col_map['mzmine_scan'],
+                        col_mzmine_mz=col_map['mzmine_mz'],
+                        col_mzmine_rt=col_map['mzmine_rt'],
+                        col_mzmine_rt_start=col_map['mzmine_rt_start'],
+                        col_mzmine_rt_end=col_map['mzmine_rt_end'],
+                        col_mzmine_height=col_map['mzmine_height'],
+                        col_mzmine_charge=col_map['mzmine_charge'],
+                        col_targets_compound=col_map['targets_compound'],
+                        col_targets_cas=col_map['targets_cas'],
+                        col_targets_smiles=col_map['targets_smiles'],
+                        col_targets_formula=col_map['targets_formula']
+                    )
+                    if not res.empty: all_res.append(res)
+                return pd.concat(all_res, ignore_index=True) if all_res else pd.DataFrame()
 
-        targets_pos = pd.DataFrame()
-        targets_neg = pd.DataFrame()
-        
-        # Load targets from Compounds.csv (Targeted workflow)
-        f_compounds.seek(0)
-        targets = pd.read_csv(f_compounds, encoding='latin1')
-        targets['clean_cas'] = targets.get(TARGETS_CAS_COL, pd.Series(dtype=str)).apply(clean_cas)
-        st.write(f"✓ Loaded {len(targets)} target compounds from Compounds.csv")
-        st.write(f"✓ Processing {len(f_gnps_pos) if f_gnps_pos else 0} ESI+ dataset(s)")
-        st.write(f"✓ Processing {len(f_gnps_neg) if f_gnps_neg else 0} ESI− dataset(s)")
-        st.info(f"📊 mzML files: ESI+ = {'✓ Uploaded' if f_mzml_pos else '✗ Not uploaded'}, ESI− = {'✓ Uploaded' if f_mzml_neg else '✗ Not uploaded'}")
-        
-        # Process based on selected polarity mode
-        if polarity_mode in ["Positive & Negative", "Positive Only"]:
-            targets_pos = run_polarity_multipe(f_gnps_pos, f_mzmine_pos, "Positive")
-        
-        if polarity_mode in ["Positive & Negative", "Negative Only"]:
-            targets_neg = run_polarity_multipe(f_gnps_neg, f_mzmine_neg, "Negative")
-        
-        # Check if results are empty
-        if targets_pos.empty and targets_neg.empty:
-            st.error("❌ No compounds matched between GNPS and MZmine files. Please verify your input data.")
+            targets_pos = pd.DataFrame()
+            targets_neg = pd.DataFrame()
+            
+            # Load targets from Compounds.csv (Targeted workflow)
+            f_compounds.seek(0)
+            targets = pd.read_csv(f_compounds, encoding='latin1')
+            col_map = get_col_mapping()
+            targets['clean_cas'] = targets.get(col_map['targets_cas'], pd.Series(dtype=str)).apply(clean_cas)
+            st.write(f"✓ Loaded {len(targets)} target compounds from Compounds.csv")
+            st.write(f"✓ Processing {len(f_gnps_pos) if f_gnps_pos else 0} ESI+ dataset(s)")
+            st.write(f"✓ Processing {len(f_gnps_neg) if f_gnps_neg else 0} ESI− dataset(s)")
+            st.info(f"📊 mzML files: ESI+ = {'✓ Uploaded' if f_mzml_pos else '✗ Not uploaded'}, ESI− = {'✓ Uploaded' if f_mzml_neg else '✗ Not uploaded'}")
+            
+            # Process based on selected polarity mode
+            if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                targets_pos = run_polarity_multipe(f_gnps_pos, f_mzmine_pos, "Positive")
+            
+            if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                targets_neg = run_polarity_multipe(f_gnps_neg, f_mzmine_neg, "Negative")
+            
+            # Check if results are empty
+            if targets_pos.empty and targets_neg.empty:
+                st.error("❌ No compounds matched between GNPS and MZmine files. Please verify your input data.")
+        except ValueError as e:
+            st.error(f"❌ **Data Format Error:**\n\n{str(e)}\n\n**Troubleshooting Tips:**\n- Ensure GNPS files are exported from GNPS library with all required columns\n- Ensure MZmine files are exported with the correct format\n- Check that file encoding is UTF-8 or Latin1")
+        except KeyError as e:
+            st.error(f"❌ **Missing Column Error:**\n\nCannot find column: {str(e)}\n\n**Troubleshooting Tips:**\n- Verify your input files have the required columns\n- Check GNPS export settings include Compound_Name, #Scan#, CAS_Number, etc.\n- Check MZmine export includes id, mz, rt, rt_range:min, rt_range:max columns")
+        except Exception as e:
+            st.error(f"❌ **Unexpected Error:**\n\n{str(e)}\n\nPlease check your input files and try again.")
             st.stop()
         
         # Concatenate available results
@@ -1791,13 +2000,15 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
         # Create consolidated match summary (one row per compound with ionization info)
         summary_data_consolidated = []
         all_compounds = set()
+        col_map = get_col_mapping()
+        col_targets_compound = col_map['targets_compound']
         
         for _, target in all_targets_original.iterrows():
-            compound_name = target.get(TARGETS_COMPOUND_COL, '')
+            compound_name = target.get(col_targets_compound, '')
             all_compounds.add(compound_name)
         
         for compound_name in sorted(all_compounds):
-            target = all_targets_original[all_targets_original[TARGETS_COMPOUND_COL] == compound_name].iloc[0] if compound_name in all_targets_original[TARGETS_COMPOUND_COL].values else None
+            target = all_targets_original[all_targets_original[col_targets_compound] == compound_name].iloc[0] if compound_name in all_targets_original[col_targets_compound].values else None
             
             # Determine ionization status
             in_pos = compound_name in matched_compounds_pos

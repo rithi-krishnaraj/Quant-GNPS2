@@ -436,12 +436,23 @@ def create_results_zip(results_dict, rt_window_mode='composite_margin'):
             csv_buffer = io.StringIO()
             results_dict['skyline_pos'].to_csv(csv_buffer, index=False)
             zf.writestr('Skyline_Transition-List_ESI-pos.csv', csv_buffer.getvalue())
-        
+
         if not results_dict.get('skyline_neg', pd.DataFrame()).empty:
             csv_buffer = io.StringIO()
             results_dict['skyline_neg'].to_csv(csv_buffer, index=False)
             zf.writestr('Skyline_Transition-List_ESI-neg.csv', csv_buffer.getvalue())
-        
+
+        # --- SKYLINE UNMATCHED COMPOUNDS ---
+        if not results_dict.get('skyline_unmatched_pos', pd.DataFrame()).empty:
+            csv_buffer = io.StringIO()
+            results_dict['skyline_unmatched_pos'].to_csv(csv_buffer, index=False)
+            zf.writestr('Skyline_Unmatched-Compounds_ESI-pos.csv', csv_buffer.getvalue())
+
+        if not results_dict.get('skyline_unmatched_neg', pd.DataFrame()).empty:
+            csv_buffer = io.StringIO()
+            results_dict['skyline_unmatched_neg'].to_csv(csv_buffer, index=False)
+            zf.writestr('Skyline_Unmatched-Compounds_ESI-neg.csv', csv_buffer.getvalue())
+
         # --- FIGURES (POS) ---
         # Filenames always carry the multiplex group number (Group1 / Group2),
         # even when only one group exists, for a fully consistent naming scheme.
@@ -491,19 +502,27 @@ def create_results_zip(results_dict, rt_window_mode='composite_margin'):
             html_str = results_dict['fig_mz_rt_2d_neg'].to_html(include_plotlyjs='cdn')
             zf.writestr('MZ-vs-RT_ESI-neg.html', html_str)
         
-        # --- XIC FIGURES ---
-        if results_dict.get('fig_xic_pos') is not None:
+        # --- XIC FIGURES (paginated: one file per page) ---
+        # Handle both old format (single Figure, from a cached pre-pagination run)
+        # and new format (list of Figures, one per page)
+        fig_xic_pos_raw = results_dict.get('fig_xic_pos')
+        fig_xic_pos_list = fig_xic_pos_raw if isinstance(fig_xic_pos_raw, list) else ([fig_xic_pos_raw] if fig_xic_pos_raw else [])
+        fig_xic_neg_raw = results_dict.get('fig_xic_neg')
+        fig_xic_neg_list = fig_xic_neg_raw if isinstance(fig_xic_neg_raw, list) else ([fig_xic_neg_raw] if fig_xic_neg_raw else [])
+
+        for page_idx, fig in enumerate(fig_xic_pos_list, start=1):
             img_buffer = io.BytesIO()
-            results_dict['fig_xic_pos'].savefig(img_buffer, format='svg', bbox_inches='tight')
+            fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr('XIC_ESI-pos.svg', img_buffer.getvalue())
-        
-        if results_dict.get('fig_xic_neg') is not None:
+            zf.writestr(f'XIC_ESI-pos_Page{page_idx}.svg', img_buffer.getvalue())
+
+        for page_idx, fig in enumerate(fig_xic_neg_list, start=1):
             img_buffer = io.BytesIO()
-            results_dict['fig_xic_neg'].savefig(img_buffer, format='svg', bbox_inches='tight')
+            fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr('XIC_ESI-neg.svg', img_buffer.getvalue())
-        
+            zf.writestr(f'XIC_ESI-neg_Page{page_idx}.svg', img_buffer.getvalue())
+
+
         # --- PDF REPORT ---
         pdf_data = create_pdf_report(results_dict)
         if pdf_data:
@@ -701,7 +720,11 @@ def parse_mgf_spectrum_list(mgf_file_content):
 def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, fragment_dedup_ppm=5, compound_match_ppm_tolerance=10):
     """
     Extracts fragment ions from MGF files to create Skyline format transitions.
-    Returns a dataframe with Skyline-compatible transition data.
+    Returns a tuple (result_df, unmatched_df):
+        - result_df: Skyline-compatible transition data.
+        - unmatched_df: one row per target compound with zero transitions,
+          with a best-effort reason (no m/z match, RT window mismatch,
+          no usable fragments, or lost to a closer competing compound).
 
     Format: Molecule List Name | Precursor Name | Precursor Formula | Precursor Adduct |
             Precursor m/z | Product m/z | Precursor Charge | Product Charge | Explicit Retention Time
@@ -713,13 +736,14 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
     4. Create Skyline transition table with precursor and fragment m/z pairs
     """
     if not mgf_files or compound_df.empty:
-        return pd.DataFrame()
-    
+        return pd.DataFrame(), pd.DataFrame()
+
     skyline_data = []
     total_spectra = 0
     matched_spectra = 0
     matched_precursor_set = set()  # Track which precursors from compound_df were matched
-    
+    spectra_records = []  # Per-spectrum diagnostics, used to explain unmatched compounds
+
     st.write(f"📂 **Skyline Input:** {len(mgf_files)} MGF file(s), {len(compound_df)} compounds to match")
     st.write(f"📊 **Compound m/z range:** {compound_df['m/z'].min():.2f} - {compound_df['m/z'].max():.2f}")
     st.write(f"⚙️ **Compound Matching Tolerance:** ±{compound_match_ppm_tolerance} ppm")
@@ -765,7 +789,7 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                 # Get precursor m/z from PEPMASS
                 precursor_mz = spectrum.get('pepmass')
                 rtinseconds = spectrum.get('rtinseconds')
-                
+
                 # Convert RT from seconds to minutes if available
                 rt_min = None
                 if rtinseconds:
@@ -773,20 +797,34 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                         rt_min = float(rtinseconds) / 60.0
                     except:
                         rt_min = None
-                
+
                 # Get fragment m/z and intensities
                 fragments = spectrum.get('fragments', [])
-                
+
+                # Record every spectrum with a precursor m/z (even if it has no
+                # peaks or doesn't end up matching) so we can explain later why
+                # any given target compound came up unmatched.
+                spectrum_record = None
+                if precursor_mz is not None:
+                    spectrum_record = {
+                        'mz': precursor_mz,
+                        'rt_min': rt_min,
+                        'has_ms2_peaks': len(fragments) > 0,
+                        'assigned_compound': None,
+                        'usable_fragments': False,
+                    }
+                    spectra_records.append(spectrum_record)
+
                 if precursor_mz is not None and len(fragments) > 0:
                     # Match compound by m/z (± compound_match_ppm_tolerance)
                     ppm_tol = compound_match_ppm_tolerance
                     matched_compound = None
                     mz_diff_best = float('inf')
-                    
+
                     for compound_name, compound_row in matched_compounds.items():
                         comp_mz = compound_row['m/z']
                         mz_diff_ppm = abs(precursor_mz - comp_mz) / comp_mz * 1e6
-                        
+
                         # Check m/z match and optionally RT window if RT is available
                         if mz_diff_ppm <= ppm_tol and mz_diff_ppm < mz_diff_best:
                             if rt_min is not None:
@@ -799,8 +837,9 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                                 # If no RT available, use closest m/z match
                                 matched_compound = compound_name
                                 mz_diff_best = mz_diff_ppm
-                    
+
                     if matched_compound:
+                        spectrum_record['assigned_compound'] = matched_compound
                         matched_spectra += 1
                         matched_precursor_set.add(matched_compound)  # Track this precursor as matched
                         compound_row = matched_compounds[matched_compound]
@@ -828,7 +867,8 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                         # Then check if those 2 are within 5 ppm (or custom threshold)
                         # If so, keep only the most abundant one
                         top_2_fragments = valid_fragments[:2]  # Take top 2 by intensity
-                        
+                        spectrum_record['usable_fragments'] = len(top_2_fragments) > 0
+
                         if len(top_2_fragments) == 0:
                             continue  # No valid fragments
                         elif len(top_2_fragments) == 1:
@@ -963,11 +1003,12 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
     
     # Count unique compounds in final output
     unique_compounds = result_df['Precursor Name'].nunique() if not result_df.empty else 0
+    compounds_with_output = set(result_df['Precursor Name'].unique()) if not result_df.empty else set()
     spectrum_dedup_count = len(skyline_data) - len(final_deduplicated)
-    
+
     st.write(f"   • Transitions (after dedup): {len(final_deduplicated)}")
     st.write(f"   • Spectrum-level duplicates removed: {spectrum_dedup_count}")
-    
+
     # Show badge with matched precursors from compound list
     precursors_in_list = len(compound_df)
     precursors_matched = len(matched_precursor_set)
@@ -976,13 +1017,82 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
         st.metric("Unique Compounds in Output", unique_compounds)
     with col2:
         st.metric("Precursors from List Matched", f"{precursors_matched}/{precursors_in_list}")
-    
+
     if total_spectra == 0:
         st.warning("⚠️ **No spectra found in MGF files!** Check that MGF files are not empty and are in proper format.")
     elif matched_spectra == 0:
         st.warning(f"⚠️ **No spectra matched to compounds!** m/z values in MGF may not match your target compounds (tolerance: ±{compound_match_ppm_tolerance} ppm).")
-    
-    return result_df
+
+    # ------------------------------------------------------------------
+    # DIAGNOSE UNMATCHED COMPOUNDS
+    # Any target compound that produced zero transitions gets a row here,
+    # with a best-effort reason based on the recorded per-spectrum data.
+    # ------------------------------------------------------------------
+    unmatched_rows = []
+    for compound_name, compound_row in matched_compounds.items():
+        if compound_name in compounds_with_output:
+            continue
+
+        comp_mz = compound_row['m/z']
+        rt_start = compound_row.get('t start (min)', None)
+        rt_stop = compound_row.get('t stop (min)', None)
+        has_rt_window = (rt_start is not None and rt_stop is not None and
+                          not pd.isna(rt_start) and not pd.isna(rt_stop))
+
+        def _ppm(mz):
+            return abs(mz - comp_mz) / comp_mz * 1e6
+
+        candidates = [(_ppm(rec['mz']), rec) for rec in spectra_records
+                      if _ppm(rec['mz']) <= compound_match_ppm_tolerance]
+        candidates.sort(key=lambda x: x[0])
+
+        if not candidates:
+            if spectra_records:
+                closest_d, closest_rec = min(((_ppm(r['mz']), r) for r in spectra_records), key=lambda x: x[0])
+                reason = (f"No MGF precursor within ±{compound_match_ppm_tolerance} ppm "
+                          f"(closest: m/z {closest_rec['mz']:.4f}, Δ{closest_d:.1f} ppm)")
+            else:
+                reason = "No MGF spectra available to match against"
+        else:
+            taken_by_other = [(d, r) for d, r in candidates if r['assigned_compound'] not in (None, compound_name)]
+            rt_failed = [(d, r) for d, r in candidates
+                         if has_rt_window and r['rt_min'] is not None and not (rt_start <= r['rt_min'] <= rt_stop)]
+            no_peaks = [(d, r) for d, r in candidates if not r['has_ms2_peaks']]
+            no_usable = [(d, r) for d, r in candidates if r['has_ms2_peaks'] and not r['usable_fragments']]
+
+            if len(taken_by_other) == len(candidates):
+                d, r = taken_by_other[0]
+                reason = (f"Closest MGF precursor (Δ{d:.1f} ppm) was instead assigned to a "
+                          f"closer target compound ('{r['assigned_compound']}')")
+            elif has_rt_window and len(rt_failed) == len(candidates):
+                d, r = rt_failed[0]
+                reason = (f"Precursor m/z matched (Δ{d:.1f} ppm) but retention time outside target "
+                          f"window [{rt_start:.2f}-{rt_stop:.2f}] min (spectrum RT = {r['rt_min']:.2f} min)")
+            elif len(no_peaks) == len(candidates):
+                d, r = no_peaks[0]
+                reason = f"Precursor m/z matched (Δ{d:.1f} ppm) but the MS2 spectrum had no fragment peaks at all"
+            elif len(no_usable) == len(candidates):
+                d, r = no_usable[0]
+                reason = f"Precursor m/z matched (Δ{d:.1f} ppm) but no fragment ions remained after excluding the precursor peak"
+            else:
+                d, r = candidates[0]
+                reason = (f"Precursor m/z matched (Δ{d:.1f} ppm) but was rejected for a mix of reasons "
+                          f"(RT window / competing compound / fragment filtering)")
+
+        unmatched_rows.append({
+            'Compound': compound_name,
+            'Target m/z': round(comp_mz, 4),
+            'RT Window (min)': f"{rt_start:.2f}-{rt_stop:.2f}" if has_rt_window else 'N/A',
+            'Reason Unmatched': reason,
+        })
+
+    unmatched_df = pd.DataFrame(unmatched_rows)
+
+    if not unmatched_df.empty:
+        st.warning(f"⚠️ **{len(unmatched_df)} compound(s) from the target list produced no Skyline transitions.** See the table below for the reason for each.")
+        st.dataframe(unmatched_df, width='stretch', use_container_width=True)
+
+    return result_df, unmatched_df
 
 def create_compound_match_summary(all_targets_df, matched_compounds_set, polarity_mode, col_targets_compound=TARGETS_COMPOUND_COL):
     """
@@ -1382,36 +1492,41 @@ def build_rt_alignment_figure(df, title, rt_window_mode="Composite range ± marg
     
     return figures
 
-def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance):
-    """Extracts TIC and XICs from mzML file for visualization"""
+def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance, targets_per_page=50):
+    """
+    Extracts TIC and XICs from mzML file for visualization.
+    Returns a list of matplotlib Figures, one per page of up to `targets_per_page`
+    compounds, so that every matched precursor is guaranteed to appear somewhere
+    (no silent truncation), or None on failure.
+    """
     if mzml_file is None or target_df.empty:
         return None
-    
+
     try:
         import tempfile
-        
+
         # Check required columns
         required_cols = ['Compound', 'm/z', 't start (min)', 't stop (min)', 'Peak_RT']
         missing_cols = [col for col in required_cols if col not in target_df.columns]
         if missing_cols:
             st.error(f"Missing required columns in target data: {missing_cols}")
             return None
-        
+
         mzml_file.seek(0)  # Reset file pointer to start
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mzML') as tmp:
             tmp.write(mzml_file.read())
             tmp_path = tmp.name
-        
+
         rt_list, tic_list = [], []
         targets = target_df.drop_duplicates('Compound')[['Compound', 'm/z', 't start (min)', 't stop (min)', 'Peak_RT']].to_dict('records')
-        
+
         if not targets:
             st.error("No unique compounds found in target data")
             return None
-        
+
         xic_data = {t['Compound']: [] for t in targets}
         target_ranges = {t['Compound']: (t['m/z'] - t['m/z'] * xic_ppm_tolerance / 2 / 1e6, t['m/z'] + t['m/z'] * xic_ppm_tolerance / 2 / 1e6) for t in targets}
-        
+
         # Debug: Show sample m/z ranges being used
         if targets:
             sample_compound = targets[0]['Compound']
@@ -1419,26 +1534,26 @@ def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance):
             mz_min, mz_max = target_ranges[sample_compound]
             ppm_delta = abs(mz_max - mz_min) / sample_mz * 1e6
             st.write(f"✓ XIC Tolerance applied: {xic_ppm_tolerance} ppm | Example: {sample_compound} @ m/z {sample_mz:.4f} → Range [{mz_min:.6f}, {mz_max:.6f}] (Δ {ppm_delta:.1f} ppm)")
-        
+
         scan_count = 0
         with mzml.read(tmp_path) as reader:
             for spec in reader:
                 if spec.get('ms level') != 1:
                     continue
-                
+
                 scan_count += 1
                 scan_data = spec.get('scanList', {}).get('scan', [{}])[0]
                 rt = scan_data.get('scan start time')
                 if rt is None:
                     continue
-                
+
                 rt_val = float(rt) / 60.0 if hasattr(rt, 'unit_info') and 'second' in rt.unit_info else float(rt)
                 rt_list.append(rt_val)
-                
+
                 mzs = spec.get('m/z array', np.array([]))
                 ints = spec.get('intensity array', np.array([]))
                 tic_list.append(ints.sum())
-                
+
                 if len(mzs) > 0:
                     for t in targets:
                         mz_min, mz_max = target_ranges[t['Compound']]
@@ -1447,84 +1562,92 @@ def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance):
                 else:
                     for t in targets:
                         xic_data[t['Compound']].append(0)
-        
+
+        os.unlink(tmp_path)
+
         if scan_count == 0:
             st.error(f"No MS1 scans found in mzML file")
             return None
-        
+
         if len(rt_list) == 0:
             st.error(f"Could not extract retention times from {scan_count} scans")
             return None
-        
-        # Create figure - with optimized height to avoid PIL decompression bomb errors
+
+        # Paginate so every target appears somewhere, instead of truncating at a
+        # fixed cap (very tall single figures risk PIL "decompression bomb" errors).
         num_targets = len(targets)
-        # Cap at ~80 compounds to keep figure size manageable (~200-250 MB when rendering)
-        num_targets_display = min(num_targets, 80)
-        fig, axes = plt.subplots(2 + num_targets_display, 1, figsize=(14, 6 + 1.2 * num_targets_display), dpi=72, sharex=True)
-        
-        # TIC
-        axes[0].plot(rt_list, tic_list, color='#444444', linewidth=1.5)
-        axes[0].fill_between(rt_list, tic_list, color='#444444', alpha=0.2)
-        axes[0].set_title(f"TIC & XICs ({title_base})", fontsize=14, fontweight='bold')
-        axes[0].set_ylabel("TIC Intensity", fontsize=11)
-        axes[0].grid(True, linestyle='--', alpha=0.7)
-        
-        # Overlaid XICs (without legend to avoid clutter)
+        pages = [targets[i:i + targets_per_page] for i in range(0, num_targets, targets_per_page)]
+        num_pages = len(pages)
         cmap = plt.get_cmap('tab20')
-        for i, t in enumerate(targets[:num_targets_display]):
-            axes[1].plot(rt_list, xic_data[t['Compound']], linewidth=1.5, color=cmap(i % 20), alpha=0.7)
-        axes[1].set_ylabel("Overlaid XICs", fontsize=11)
-        axes[1].grid(True, linestyle='--', alpha=0.7)
-        
-        # Individual XICs with improved labels
-        for i, t in enumerate(targets[:num_targets_display]):
-            ax = axes[2 + i]
-            color = cmap(i % 20)
-            xic_values = xic_data[t['Compound']]
-            
-            ax.plot(rt_list, xic_values, color=color, linewidth=2)
-            ax.fill_between(rt_list, xic_values, color=color, alpha=0.25)
-            
-            # Highlight RT window
-            if 't start (min)' in t and 't stop (min)' in t:
-                ax.axvspan(t['t start (min)'], t['t stop (min)'], color='gray', alpha=0.1, zorder=0, label='RT Window')
-            
-            # Mark peak RT with vertical line
-            peak_rt = t['Peak_RT']
-            ax.axvline(peak_rt, color='red', linestyle='--', linewidth=1.5, alpha=0.7, zorder=2)
-            
-            # Add RT label on the peak line
-            max_intensity = max(xic_values) if xic_values else 1
-            ax.text(peak_rt, max_intensity * 0.95, f'RT: {peak_rt:.2f}', rotation=0, fontsize=9, 
-                   ha='center', va='top', color='red', fontweight='bold',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.6, edgecolor='red'))
-            
-            # Compound label - positioned to avoid peak if possible
-            label_rt = 0.5 if peak_rt > 8 else 15  # Position label on opposite side of peak
-            label_y_pos = max_intensity * 0.75
-            ax.text(label_rt, label_y_pos, f"{t['Compound']}\nm/z: {t['m/z']:.4f}", 
-                   fontsize=10, fontweight='bold', 
-                   bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.85, edgecolor='black', linewidth=1),
-                   ha='left' if label_rt < 8 else 'right', va='top')
-            
-            ax.set_ylabel("Intensity", fontsize=10)
-            ax.grid(True, linestyle='--', alpha=0.5)
-            ax.set_ylim(bottom=0)
-        
-        axes[-1].set_xlabel("Retention Time (min)", fontsize=12, fontweight='bold')
-        axes[-1].set_xlim(0, 16)
-        axes[-1].set_xticks(np.arange(0, 17, 2))
+        figures = []
+
         import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', category=UserWarning)
-            plt.tight_layout()
-        
-        os.unlink(tmp_path)
-        if num_targets > num_targets_display:
-            st.success(f"✓ Extracted XICs from {scan_count} MS1 scans for {num_targets_display}/{num_targets} targets (limited for performance)")
-        else:
-            st.success(f"✓ Extracted XICs from {scan_count} MS1 scans for {num_targets} targets")
-        return fig
+
+        for page_idx, page_targets in enumerate(pages, start=1):
+            n = len(page_targets)
+            fig, axes = plt.subplots(2 + n, 1, figsize=(14, 6 + 1.2 * n), dpi=72, sharex=True)
+
+            page_title = f"TIC & XICs ({title_base})" + (f" — Page {page_idx}/{num_pages}" if num_pages > 1 else "")
+
+            # TIC
+            axes[0].plot(rt_list, tic_list, color='#444444', linewidth=1.5)
+            axes[0].fill_between(rt_list, tic_list, color='#444444', alpha=0.2)
+            axes[0].set_title(page_title, fontsize=14, fontweight='bold')
+            axes[0].set_ylabel("TIC Intensity", fontsize=11)
+            axes[0].grid(True, linestyle='--', alpha=0.7)
+
+            # Overlaid XICs for this page's compounds (without legend to avoid clutter)
+            for i, t in enumerate(page_targets):
+                axes[1].plot(rt_list, xic_data[t['Compound']], linewidth=1.5, color=cmap(i % 20), alpha=0.7)
+            axes[1].set_ylabel("Overlaid XICs", fontsize=11)
+            axes[1].grid(True, linestyle='--', alpha=0.7)
+
+            # Individual XICs with improved labels
+            for i, t in enumerate(page_targets):
+                ax = axes[2 + i]
+                color = cmap(i % 20)
+                xic_values = xic_data[t['Compound']]
+
+                ax.plot(rt_list, xic_values, color=color, linewidth=2)
+                ax.fill_between(rt_list, xic_values, color=color, alpha=0.25)
+
+                # Highlight RT window
+                if 't start (min)' in t and 't stop (min)' in t:
+                    ax.axvspan(t['t start (min)'], t['t stop (min)'], color='gray', alpha=0.1, zorder=0, label='RT Window')
+
+                # Mark peak RT with vertical line
+                peak_rt = t['Peak_RT']
+                ax.axvline(peak_rt, color='red', linestyle='--', linewidth=1.5, alpha=0.7, zorder=2)
+
+                # Add RT label on the peak line
+                max_intensity = max(xic_values) if xic_values else 1
+                ax.text(peak_rt, max_intensity * 0.95, f'RT: {peak_rt:.2f}', rotation=0, fontsize=9,
+                       ha='center', va='top', color='red', fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.6, edgecolor='red'))
+
+                # Compound label - positioned to avoid peak if possible
+                label_rt = 0.5 if peak_rt > 8 else 15  # Position label on opposite side of peak
+                label_y_pos = max_intensity * 0.75
+                ax.text(label_rt, label_y_pos, f"{t['Compound']}\nm/z: {t['m/z']:.4f}",
+                       fontsize=10, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.85, edgecolor='black', linewidth=1),
+                       ha='left' if label_rt < 8 else 'right', va='top')
+
+                ax.set_ylabel("Intensity", fontsize=10)
+                ax.grid(True, linestyle='--', alpha=0.5)
+                ax.set_ylim(bottom=0)
+
+            axes[-1].set_xlabel("Retention Time (min)", fontsize=12, fontweight='bold')
+            axes[-1].set_xlim(0, 16)
+            axes[-1].set_xticks(np.arange(0, 17, 2))
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=UserWarning)
+                plt.tight_layout()
+
+            figures.append(fig)
+
+        st.success(f"✓ Extracted XICs from {scan_count} MS1 scans for all {num_targets} targets, across {num_pages} page(s) of up to {targets_per_page} compounds each")
+        return figures
     except Exception as e:
         st.error(f"❌ Could not parse mzML file: {str(e)}")
         import traceback
@@ -2101,12 +2224,14 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
         # 7. Generate Skyline output if MGF files provided
         skyline_pos = pd.DataFrame()
         skyline_neg = pd.DataFrame()
-        
+        skyline_unmatched_pos = pd.DataFrame()
+        skyline_unmatched_neg = pd.DataFrame()
+
         if generate_skyline:
             if mgf_pos_files and not final_pos.empty:
                 try:
                     with st.spinner("📊 Extracting Skyline transitions from ESI+ MGF..."):
-                        skyline_pos = extract_skyline_transitions_from_mgf(mgf_pos_files, final_pos, "Positive", fragment_dedup_ppm, compound_match_ppm_tolerance)
+                        skyline_pos, skyline_unmatched_pos = extract_skyline_transitions_from_mgf(mgf_pos_files, final_pos, "Positive", fragment_dedup_ppm, compound_match_ppm_tolerance)
                         if not skyline_pos.empty:
                             st.write(f"✓ Extracted {len(skyline_pos)} transitions from ESI+ MGF")
                         else:
@@ -2115,11 +2240,11 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
                     st.error(f"❌ Error processing ESI+ MGF: {str(e)}")
             elif not mgf_pos_files and polarity_mode in ["Positive & Negative", "Positive Only"] and not final_pos.empty:
                 st.info("ℹ️ Skyline requested but no ESI+ MGF file was uploaded — ESI+ Skyline list will be skipped.")
-            
+
             if mgf_neg_files and not final_neg.empty:
                 try:
                     with st.spinner("📊 Extracting Skyline transitions from ESI− MGF..."):
-                        skyline_neg = extract_skyline_transitions_from_mgf(mgf_neg_files, final_neg, "Negative", fragment_dedup_ppm, compound_match_ppm_tolerance)
+                        skyline_neg, skyline_unmatched_neg = extract_skyline_transitions_from_mgf(mgf_neg_files, final_neg, "Negative", fragment_dedup_ppm, compound_match_ppm_tolerance)
                         if not skyline_neg.empty:
                             st.write(f"✓ Extracted {len(skyline_neg)} transitions from ESI− MGF")
                         else:
@@ -2141,6 +2266,7 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
             'fig_mz_rt_2d_pos': fig_mz_rt_2d_pos, 'fig_mz_rt_2d_neg': fig_mz_rt_2d_neg,
             'match_summary': match_summary_consolidated,
             'skyline_pos': skyline_pos, 'skyline_neg': skyline_neg,
+            'skyline_unmatched_pos': skyline_unmatched_pos, 'skyline_unmatched_neg': skyline_unmatched_neg,
             'mode': polarity_mode,
             'resolution': orbitrap_resolution,
             'it_mode': it_mode,
@@ -2172,8 +2298,16 @@ def build_compound_selector(df, key_prefix, title="Select Compounds to Include")
     
     # Initialize session state for this selector if not exists
     selection_key = f"compounds_{key_prefix}"
+    current_compounds = df['Compound'].unique()
     if selection_key not in st.session_state:
-        st.session_state[selection_key] = {cmp: True for cmp in df['Compound'].unique()}
+        st.session_state[selection_key] = {cmp: True for cmp in current_compounds}
+    else:
+        # The matched compound list can change between runs (different inputs,
+        # settings, etc.) — backfill any compound not seen in a prior run so
+        # the checkbox lookup below never KeyErrors on a new/renamed compound.
+        for cmp in current_compounds:
+            if cmp not in st.session_state[selection_key]:
+                st.session_state[selection_key][cmp] = True
     
     with st.expander(f"✏️ {title} ({len(df)} compounds)", expanded=False):
         col1, col2, col3 = st.columns([1, 1, 1])
@@ -2196,7 +2330,7 @@ def build_compound_selector(df, key_prefix, title="Select Compounds to Include")
             with col:
                 st.session_state[selection_key][compound] = st.checkbox(
                     compound,
-                    value=st.session_state[selection_key][compound],
+                    value=st.session_state[selection_key].get(compound, True),
                     key=f"checkbox_{key_prefix}_{compound}"
                 )
     
@@ -2343,23 +2477,42 @@ if 'results' in st.session_state:
     if r.get('fig_xic_pos') or r.get('fig_xic_neg'):
         st.subheader("🗂️ Extracted Ion Chromatograms (XICs)")
         cols = st.columns(2) if r['mode'] == "Positive & Negative" and r.get('fig_xic_pos') and r.get('fig_xic_neg') else [st.container()]
-        
-        if r.get('fig_xic_pos'):
+
+        # Handle both old format (single Figure, from a cached pre-pagination run)
+        # and new format (list of Figures, one per page)
+        fig_xic_pos_list = r['fig_xic_pos'] if isinstance(r.get('fig_xic_pos'), list) else ([r['fig_xic_pos']] if r.get('fig_xic_pos') else [])
+        fig_xic_neg_list = r['fig_xic_neg'] if isinstance(r.get('fig_xic_neg'), list) else ([r['fig_xic_neg']] if r.get('fig_xic_neg') else [])
+
+        if r.get('fig_xic_pos') is not None and not isinstance(r.get('fig_xic_pos'), list):
+            st.warning("⚠️ This ESI+ XIC figure is from an older run (capped at ~80 compounds, no pagination). Click **'▶ Evaluate & Optimize Method'** again to regenerate it with full pagination.")
+        if r.get('fig_xic_neg') is not None and not isinstance(r.get('fig_xic_neg'), list):
+            st.warning("⚠️ This ESI− XIC figure is from an older run (capped at ~80 compounds, no pagination). Click **'▶ Evaluate & Optimize Method'** again to regenerate it with full pagination.")
+
+        if fig_xic_pos_list:
             with cols[0] if r['mode'] == "Positive & Negative" else st.container():
-                st.markdown("**ESI+ XICs from LC-MS Raw Data**")
-                st.pyplot(r['fig_xic_pos'])
-        
-        if r.get('fig_xic_neg'):
+                st.markdown(f"**ESI+ XICs from LC-MS Raw Data** ({len(fig_xic_pos_list)} page(s))")
+                for page_idx, fig in enumerate(fig_xic_pos_list, start=1):
+                    if len(fig_xic_pos_list) > 1:
+                        st.caption(f"Page {page_idx}/{len(fig_xic_pos_list)}")
+                    st.pyplot(fig)
+
+        if fig_xic_neg_list:
             with cols[1] if r['mode'] == "Positive & Negative" else st.container():
-                st.markdown("**ESI− XICs from LC-MS Raw Data**")
-                st.pyplot(r['fig_xic_neg'])
+                st.markdown(f"**ESI− XICs from LC-MS Raw Data** ({len(fig_xic_neg_list)} page(s))")
+                for page_idx, fig in enumerate(fig_xic_neg_list, start=1):
+                    if len(fig_xic_neg_list) > 1:
+                        st.caption(f"Page {page_idx}/{len(fig_xic_neg_list)}")
+                    st.pyplot(fig)
     else:
         st.info("ℹ️ No XIC figures available. Upload mzML files for chromatogram visualization.")
     
     st.divider()
     
     # Skyline Output Section
-    if not r['skyline_pos'].empty or not r['skyline_neg'].empty:
+    has_skyline_content = (not r['skyline_pos'].empty or not r['skyline_neg'].empty or
+                            not r.get('skyline_unmatched_pos', pd.DataFrame()).empty or
+                            not r.get('skyline_unmatched_neg', pd.DataFrame()).empty)
+    if has_skyline_content:
         st.subheader("🎯 Skyline Mass List Table")
         st.markdown("**Formatted MS/MS transitions for direct import into Skyline. Includes 2 most abundant fragments per precursor.**")
         
@@ -2381,7 +2534,7 @@ if 'results' in st.session_state:
         if not r['skyline_pos'].empty:
             st.markdown("#### 📍 ESI+ (Positive)")
             st.dataframe(r['skyline_pos'], width='stretch', use_container_width=True)
-            
+
             # Download Skyline CSV
             skyline_csv_pos = r['skyline_pos'].to_csv(index=False)
             st.download_button(
@@ -2391,11 +2544,24 @@ if 'results' in st.session_state:
                 mime="text/csv",
                 key="download_skyline_pos"
             )
-        
+
+        unmatched_pos = r.get('skyline_unmatched_pos', pd.DataFrame())
+        if not unmatched_pos.empty:
+            st.markdown(f"##### ⚠️ ESI+ Unmatched Compounds ({len(unmatched_pos)})")
+            st.dataframe(unmatched_pos, width='stretch', use_container_width=True)
+            unmatched_csv_pos = unmatched_pos.to_csv(index=False)
+            st.download_button(
+                label="⬇️ Download Skyline_Unmatched-Compounds_ESI-pos",
+                data=unmatched_csv_pos,
+                file_name="Skyline_Unmatched-Compounds_ESI-pos.csv",
+                mime="text/csv",
+                key="download_skyline_unmatched_pos"
+            )
+
         if not r['skyline_neg'].empty:
             st.markdown("#### 📍 ESI− (Negative)")
             st.dataframe(r['skyline_neg'], width='stretch', use_container_width=True)
-            
+
             # Download Skyline CSV
             skyline_csv_neg = r['skyline_neg'].to_csv(index=False)
             st.download_button(
@@ -2405,7 +2571,20 @@ if 'results' in st.session_state:
                 mime="text/csv",
                 key="download_skyline_neg"
             )
-        
+
+        unmatched_neg = r.get('skyline_unmatched_neg', pd.DataFrame())
+        if not unmatched_neg.empty:
+            st.markdown(f"##### ⚠️ ESI− Unmatched Compounds ({len(unmatched_neg)})")
+            st.dataframe(unmatched_neg, width='stretch', use_container_width=True)
+            unmatched_csv_neg = unmatched_neg.to_csv(index=False)
+            st.download_button(
+                label="⬇️ Download Skyline_Unmatched-Compounds_ESI-neg",
+                data=unmatched_csv_neg,
+                file_name="Skyline_Unmatched-Compounds_ESI-neg.csv",
+                mime="text/csv",
+                key="download_skyline_unmatched_neg"
+            )
+
         st.divider()
     
     # Inclusion List / MS Export
