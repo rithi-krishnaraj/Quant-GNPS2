@@ -133,7 +133,7 @@ def create_thermo_fisher_csv(df, rt_window_mode='composite_margin'):
         'Formula': df.get('Formula', ''),
         'Adduct': df.get('Adduct', ''),
         'm/z': df['m/z'].round(4),
-        'z': df['z'],
+        'z': df['z'].astype(int),  # Force integer for charge
     }
     
     # Add RT columns based on mode
@@ -204,7 +204,8 @@ def create_pdf_report(results_dict):
     has_multiplex = False
     pos_df = results_dict.get('pos', pd.DataFrame())
     neg_df = results_dict.get('neg', pd.DataFrame())
-    if ('Multiplex_Group' in pos_df.columns or 'Multiplex_Group' in neg_df.columns):
+    if ('Multiplex_Group' in pos_df.columns and pos_df['Multiplex_Group'].nunique() > 1) or \
+       ('Multiplex_Group' in neg_df.columns and neg_df['Multiplex_Group'].nunique() > 1):
         has_multiplex = True
     
     settings_data = [
@@ -214,7 +215,8 @@ def create_pdf_report(results_dict):
         ['Max Injection Time Mode', results_dict.get('it_mode', 'N/A')],
         ['HCD Collision Energies', results_dict.get('hcd_energies', 'N/A')],
         ['XIC m/z Tolerance (ppm)', str(results_dict.get('xic_ppm', 'N/A'))],
-        ['Fragment m/z Tolerance (ppm)', str(results_dict.get('fragment_dedup_ppm', 'N/A'))],
+        ['Compound Matching Tolerance (ppm)', str(results_dict.get('compound_match_ppm_tolerance', 'N/A'))],
+        ['Fragment Dedup Tolerance (ppm)', str(results_dict.get('fragment_dedup_ppm', 'N/A'))],
         ['RT Window Mode', results_dict.get('rt_window_mode', 'N/A')],
         ['RT Margin (min)', str(results_dict.get('rt_margin', 'N/A'))],
         ['Multiplex Splitting', 'YES — Two Inclusion Lists' if has_multiplex else 'NO — Single Inclusion List'],
@@ -381,9 +383,9 @@ def create_pdf_report(results_dict):
         story.append(Paragraph("Interactive Visualizations", heading_style))
         interactive_note = "The following interactive Plotly visualizations are included in the ZIP file:<br/><br/>"
         if results_dict.get('fig_mz_rt_2d_pos') is not None:
-            interactive_note += "• <b>ESI_Positive_MZ_vs_RT.html</b> - ESI+ m/z vs Retention Time (interactive scatter plot)<br/>"
+            interactive_note += "• <b>MZ-vs-RT_ESI-pos.html</b> - ESI+ m/z vs Retention Time (interactive scatter plot)<br/>"
         if results_dict.get('fig_mz_rt_2d_neg') is not None:
-            interactive_note += "• <b>ESI_Negative_MZ_vs_RT.html</b> - ESI− m/z vs Retention Time (interactive scatter plot)<br/>"
+            interactive_note += "• <b>MZ-vs-RT_ESI-neg.html</b> - ESI− m/z vs Retention Time (interactive scatter plot)<br/>"
         interactive_note += "<br/>Open these HTML files in your web browser to explore the data interactively (hover for details, zoom, pan, etc.)."
         story.append(Paragraph(interactive_note, styles['Normal']))
     
@@ -397,131 +399,112 @@ def create_results_zip(results_dict, rt_window_mode='composite_margin'):
     """Creates a zip file containing all results tables and figures"""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # Add consolidated match summary
+        # Match Summary
         if 'match_summary' in results_dict and not results_dict['match_summary'].empty:
             csv_buffer = io.StringIO()
             results_dict['match_summary'].to_csv(csv_buffer, index=False)
             zf.writestr('Compound_Match_Summary.csv', csv_buffer.getvalue())
         
-        # Add full ESI+ and ESI- results (matched compounds only)
+        # --- POSITIVE DATA ---
         if not results_dict['pos'].empty:
-            csv_buffer = io.StringIO()
-            results_dict['pos'].to_csv(csv_buffer, index=False)
-            zf.writestr('ESI_Positive_Results.csv', csv_buffer.getvalue())
-        
+            has_multi_pos = 'Multiplex_Group' in results_dict['pos'].columns and results_dict['pos']['Multiplex_Group'].nunique() > 1
+            if has_multi_pos:
+                for grp in [1, 2]:
+                    pos_grp = results_dict['pos'][results_dict['pos']['Multiplex_Group'] == grp]
+                    if not pos_grp.empty:
+                        csv_data = create_thermo_fisher_csv(pos_grp, rt_window_mode)
+                        zf.writestr(f'Exploris_Inclusion-List_ESI-pos_Group{grp}.csv', csv_data)
+            else:
+                csv_data = create_thermo_fisher_csv(results_dict['pos'], rt_window_mode)
+                zf.writestr('Exploris_Inclusion-List_ESI-pos.csv', csv_data)
+                
+        # --- NEGATIVE DATA ---
         if not results_dict['neg'].empty:
-            csv_buffer = io.StringIO()
-            results_dict['neg'].to_csv(csv_buffer, index=False)
-            zf.writestr('ESI_Negative_Results.csv', csv_buffer.getvalue())
+            has_multi_neg = 'Multiplex_Group' in results_dict['neg'].columns and results_dict['neg']['Multiplex_Group'].nunique() > 1
+            if has_multi_neg:
+                for grp in [1, 2]:
+                    neg_grp = results_dict['neg'][results_dict['neg']['Multiplex_Group'] == grp]
+                    if not neg_grp.empty:
+                        csv_data = create_thermo_fisher_csv(neg_grp, rt_window_mode)
+                        zf.writestr(f'Exploris_Inclusion-List_ESI-neg_Group{grp}.csv', csv_data)
+            else:
+                csv_data = create_thermo_fisher_csv(results_dict['neg'], rt_window_mode)
+                zf.writestr('Exploris_Inclusion-List_ESI-neg.csv', csv_data)
         
-        # Add Thermo Fisher format inclusion lists
-        if not results_dict['pos'].empty:
-            thermo_csv_pos = create_thermo_fisher_csv(results_dict['pos'], rt_window_mode)
-            zf.writestr('ESI_Positive_InclusionList_ThermoFormat.csv', thermo_csv_pos)
-            
-            # Add separate group files if multiplex splitting was used
-            if 'Multiplex_Group' in results_dict['pos'].columns:
-                pos_g1 = results_dict['pos'][results_dict['pos']['Multiplex_Group'] == 1]
-                pos_g2 = results_dict['pos'][results_dict['pos']['Multiplex_Group'] == 2]
-                
-                if not pos_g1.empty:
-                    thermo_csv_pos_g1 = create_thermo_fisher_csv(pos_g1, rt_window_mode)
-                    zf.writestr('ESI_Positive_Group1_Inclusion_List.csv', thermo_csv_pos_g1)
-                
-                if not pos_g2.empty:
-                    thermo_csv_pos_g2 = create_thermo_fisher_csv(pos_g2, rt_window_mode)
-                    zf.writestr('ESI_Positive_Group2_Inclusion_List.csv', thermo_csv_pos_g2)
-        
-        if not results_dict['neg'].empty:
-            thermo_csv_neg = create_thermo_fisher_csv(results_dict['neg'], rt_window_mode)
-            zf.writestr('ESI_Negative_InclusionList_ThermoFormat.csv', thermo_csv_neg)
-            
-            # Add separate group files if multiplex splitting was used
-            if 'Multiplex_Group' in results_dict['neg'].columns:
-                neg_g1 = results_dict['neg'][results_dict['neg']['Multiplex_Group'] == 1]
-                neg_g2 = results_dict['neg'][results_dict['neg']['Multiplex_Group'] == 2]
-                
-                if not neg_g1.empty:
-                    thermo_csv_neg_g1 = create_thermo_fisher_csv(neg_g1, rt_window_mode)
-                    zf.writestr('ESI_Negative_Group1_Inclusion_List.csv', thermo_csv_neg_g1)
-                
-                if not neg_g2.empty:
-                    thermo_csv_neg_g2 = create_thermo_fisher_csv(neg_g2, rt_window_mode)
-                    zf.writestr('ESI_Negative_Group2_Inclusion_List.csv', thermo_csv_neg_g2)
-        
-        # Add Skyline transitions if available
+        # --- SKYLINE LISTS ---
         if not results_dict.get('skyline_pos', pd.DataFrame()).empty:
             csv_buffer = io.StringIO()
             results_dict['skyline_pos'].to_csv(csv_buffer, index=False)
-            zf.writestr('ESI_Positive_Skyline-Mass-List-Table.csv', csv_buffer.getvalue())
+            zf.writestr('Skyline_Transition-List_ESI-pos.csv', csv_buffer.getvalue())
         
         if not results_dict.get('skyline_neg', pd.DataFrame()).empty:
             csv_buffer = io.StringIO()
             results_dict['skyline_neg'].to_csv(csv_buffer, index=False)
-            zf.writestr('ESI_Negative_Skyline-Mass-List-Table.csv', csv_buffer.getvalue())
+            zf.writestr('Skyline_Transition-List_ESI-neg.csv', csv_buffer.getvalue())
         
-        # Add points per peak figures (SVG)
-        for grp, fig in results_dict['fp_pos']:
+        # --- FIGURES (POS) ---
+        # Filenames always carry the multiplex group number (Group1 / Group2),
+        # even when only one group exists, for a fully consistent naming scheme.
+        for grp, fig in results_dict.get('fp_pos', []):
             img_buffer = io.BytesIO()
             fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr(f'ESI_Positive_PointsPerPeak_Group{grp}.svg', img_buffer.getvalue())
+            zf.writestr(f'Points-per-Peak_ESI-pos_Group{grp}.svg', img_buffer.getvalue())
         
-        for grp, fig in results_dict['fp_neg']:
+        for grp, fig in results_dict.get('fc_pos', []):
             img_buffer = io.BytesIO()
             fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr(f'ESI_Negative_PointsPerPeak_Group{grp}.svg', img_buffer.getvalue())
-        
-        # Add concurrency figures (SVG)
-        for grp, fig in results_dict['fc_pos']:
+            zf.writestr(f'Concurrency_ESI-pos_Group{grp}.svg', img_buffer.getvalue())
+            
+        for grp, fig in results_dict.get('fig_rt_pos', []):
             img_buffer = io.BytesIO()
             fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr(f'ESI_Positive_Concurrency_Group{grp}.svg', img_buffer.getvalue())
-        
-        for grp, fig in results_dict['fc_neg']:
+            zf.writestr(f'RT-alignement_ESI-pos_Group{grp}.svg', img_buffer.getvalue())
+            
+        # --- FIGURES (NEG) ---
+        for grp, fig in results_dict.get('fp_neg', []):
             img_buffer = io.BytesIO()
             fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr(f'ESI_Negative_Concurrency_Group{grp}.svg', img_buffer.getvalue())
+            zf.writestr(f'Points-per-Peak_ESI-neg_Group{grp}.svg', img_buffer.getvalue())
         
-        # Add RT alignment figures (SVG)
-        for grp, fig in results_dict['fig_rt_pos']:
+        for grp, fig in results_dict.get('fc_neg', []):
             img_buffer = io.BytesIO()
             fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr(f'ESI_Positive_RTAlignment_Group{grp}.svg', img_buffer.getvalue())
-        
-        for grp, fig in results_dict['fig_rt_neg']:
+            zf.writestr(f'Concurrency_ESI-neg_Group{grp}.svg', img_buffer.getvalue())
+            
+        for grp, fig in results_dict.get('fig_rt_neg', []):
             img_buffer = io.BytesIO()
             fig.savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr(f'ESI_Negative_RTAlignment_Group{grp}.svg', img_buffer.getvalue())
+            zf.writestr(f'RT-alignement_ESI-neg_Group{grp}.svg', img_buffer.getvalue())
         
-        # Add m/z vs RT 2D figures (HTML - interactive Plotly)
+        # --- PLOTLY (MZ vs RT) ---
         if results_dict.get('fig_mz_rt_2d_pos') is not None:
             html_str = results_dict['fig_mz_rt_2d_pos'].to_html(include_plotlyjs='cdn')
-            zf.writestr('ESI_Positive_MZ_vs_RT.html', html_str)
+            zf.writestr('MZ-vs-RT_ESI-pos.html', html_str)
         
         if results_dict.get('fig_mz_rt_2d_neg') is not None:
             html_str = results_dict['fig_mz_rt_2d_neg'].to_html(include_plotlyjs='cdn')
-            zf.writestr('ESI_Negative_MZ_vs_RT.html', html_str)
+            zf.writestr('MZ-vs-RT_ESI-neg.html', html_str)
         
-        # Add XIC figures (SVG) if they exist
+        # --- XIC FIGURES ---
         if results_dict.get('fig_xic_pos') is not None:
             img_buffer = io.BytesIO()
             results_dict['fig_xic_pos'].savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr('ESI_Positive_XICs.svg', img_buffer.getvalue())
+            zf.writestr('XIC_ESI-pos.svg', img_buffer.getvalue())
         
         if results_dict.get('fig_xic_neg') is not None:
             img_buffer = io.BytesIO()
             results_dict['fig_xic_neg'].savefig(img_buffer, format='svg', bbox_inches='tight')
             img_buffer.seek(0)
-            zf.writestr('ESI_Negative_XICs.svg', img_buffer.getvalue())
+            zf.writestr('XIC_ESI-neg.svg', img_buffer.getvalue())
         
-        # Add PDF report if available
+        # --- PDF REPORT ---
         pdf_data = create_pdf_report(results_dict)
         if pdf_data:
             zf.writestr('PRM_Method_Report.pdf', pdf_data)
@@ -542,11 +525,74 @@ def get_core_name(name):
     name = re.sub(r'[^a-z0-9]', '', name)
     return name
 
+_ADDUCT_SUPERSCRIPT_MAP = str.maketrans({
+    '⁺': '+', '⁻': '-', '⁰': '0', '¹': '1', '²': '2', '³': '3',
+    '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+})
+
+def format_adduct(raw_adduct, polarity):
+    """
+    Normalizes any adduct string into the strict '[M+H]' style bracket format
+    (no charge symbol left inside or outside the brackets), e.g.:
+        'M+H'        -> '[M+H]'
+        '[M+H]+'     -> '[M+H]'
+        'M+H]+'      -> '[M+H]'
+        '[M+2H]2+'   -> '[M+2H]'
+        '[M+3H]3+'   -> '[M+3H]'
+        '[M-H]-'     -> '[M-H]'
+        'M+H+1'      -> '[M+H]'  (sign-then-digit charge notation)
+        '(M+H)+'     -> '[M+H]'  (parentheses instead of brackets)
+        '' / NaN     -> '[M+H]' or '[M-H]' (polarity default)
+    """
+    default = 'M+H' if polarity == 'Positive' else 'M-H'
+
+    if raw_adduct is None or (isinstance(raw_adduct, float) and pd.isna(raw_adduct)):
+        s = default
+    else:
+        s = str(raw_adduct).strip()
+
+    if s.lower() in ['nan', 'none', 'null', '']:
+        s = default
+
+    # Normalize unicode superscript charge notation (e.g. '⁺', '²⁺') to ASCII
+    s = s.translate(_ADDUCT_SUPERSCRIPT_MAP)
+
+    # Strip any existing brackets/parentheses
+    s = s.replace('[', '').replace(']', '').replace('(', '').replace(')', '').strip()
+
+    # Strip trailing charge notation in any order/repetition of digits and +/-
+    # (e.g. '+', '-', '2+', '2-', '++', '+1', '3+'), as long as it doesn't
+    # consume the whole string.
+    s = re.sub(r'[\d]*[+-][\d+-]*\s*$', '', s).strip()
+
+    # If nothing (or no 'M') is left, fall back to the polarity default
+    if not s or 'M' not in s.upper():
+        s = default
+
+    return f'[{s}]'
+
 def calculate_scan_time(resolution, it_mode, custom_it, peak_width_sec, desired_pts, concurrent_targets):
     """
     Calculates the true cycle time based on Thermo Exploris parallelized architecture.
     """
-    transients = {15000: 16, 30000: 32, 60000: 64, 120000: 128, 240000: 256}
+    # Exact transient times for Exploris 480 resolutions (in ms)
+    transients = {
+        7500: 8,
+        11250: 12,
+        15000: 16,
+        22500: 24,
+        30000: 32,
+        45000: 48,
+        60000: 64,
+        75000: 80,
+        90000: 96,
+        120000: 128,
+        180000: 192,
+        240000: 256,
+        480000: 512
+    }
+    
+    # Safely match to exact resolution, fallback to closest if somehow unlisted
     res_key = min(transients.keys(), key=lambda k: abs(k - resolution))
     t_trans = transients[res_key]
     overhead_ms = 8 
@@ -606,8 +652,11 @@ def parse_mgf_spectrum_list(mgf_file_content):
             continue
         
         if not in_ions or not line or '=' not in line:
-            if in_ions and current_spectrum and line and peaks_collected < num_peaks:
-                # Parse fragment line (mz intensity)
+            # Parse fragment line (mz intensity). Some MGF exports omit the
+            # "NUM PEAKS=" header entirely, so peak lines are collected as
+            # long as they parse as two numeric tokens rather than being
+            # gated on a declared peak count.
+            if in_ions and current_spectrum and line:
                 parts = line.split()
                 if len(parts) >= 2:
                     try:
@@ -649,17 +698,17 @@ def parse_mgf_spectrum_list(mgf_file_content):
     return spectra
 
 
-def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, fragment_dedup_ppm=5):
+def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, fragment_dedup_ppm=5, compound_match_ppm_tolerance=10):
     """
     Extracts fragment ions from MGF files to create Skyline format transitions.
     Returns a dataframe with Skyline-compatible transition data.
-    
-    Format: Molecule List Name | Precursor Name | Precursor Formula | Precursor Adduct | 
+
+    Format: Molecule List Name | Precursor Name | Precursor Formula | Precursor Adduct |
             Precursor m/z | Product m/z | Precursor Charge | Product Charge | Explicit Retention Time
-    
+
     WORKFLOW:
     1. Parse MGF file to extract PEPMASS (precursor m/z) and fragments
-    2. Match PEPMASS to compounds using ±10 ppm m/z tolerance
+    2. Match PEPMASS to compounds using ±compound_match_ppm_tolerance ppm m/z tolerance
     3. Extract the 2 most abundant fragments (by intensity)
     4. Create Skyline transition table with precursor and fragment m/z pairs
     """
@@ -673,6 +722,7 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
     
     st.write(f"📂 **Skyline Input:** {len(mgf_files)} MGF file(s), {len(compound_df)} compounds to match")
     st.write(f"📊 **Compound m/z range:** {compound_df['m/z'].min():.2f} - {compound_df['m/z'].max():.2f}")
+    st.write(f"⚙️ **Compound Matching Tolerance:** ±{compound_match_ppm_tolerance} ppm")
     st.write(f"⚙️ **Fragment Dedup Threshold:** {fragment_dedup_ppm} ppm")
     
     # Create lookup tables for compound matching
@@ -728,8 +778,8 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                 fragments = spectrum.get('fragments', [])
                 
                 if precursor_mz is not None and len(fragments) > 0:
-                    # Match compound by m/z (±10 ppm tolerance)
-                    ppm_tol = 10
+                    # Match compound by m/z (± compound_match_ppm_tolerance)
+                    ppm_tol = compound_match_ppm_tolerance
                     matched_compound = None
                     mz_diff_best = float('inf')
                     
@@ -819,20 +869,8 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                             precursor_charge = int(z_value) if z_value is not None else (1 if polarity_mode == 'Positive' else -1)
                         
                         # Format adduct string: must be in brackets [X] with nothing outside
-                        # Examples: M+H -> [M+H], [M+H]+ -> [M+H], M-H -> [M-H]
                         adduct_raw = compound_row.get('Adduct', 'M+H' if polarity_mode == 'Positive' else 'M-H')
-                        adduct_str = str(adduct_raw).strip()
-                        # Remove all existing brackets and trailing +/-
-                        adduct_str = adduct_str.replace('[', '').replace(']', '').rstrip('+-')
-                        
-                        # Validate adduct - must contain M or be empty
-                        # Common valid adducts: M+H, M-H, M+Na, M+K, M+NH4, etc.
-                        if adduct_str and 'M' not in adduct_str.upper():
-                            # Invalid adduct (not empty, but doesn't contain M), use polarity default
-                            adduct_str = 'M+H' if polarity_mode == 'Positive' else 'M-H'
-                        
-                        # Wrap in clean brackets (leave empty if no adduct)
-                        adduct = f'[{adduct_str}]' if adduct_str else ''
+                        adduct = format_adduct(adduct_raw, polarity_mode)
                         
                         # Get retention time
                         rt = compound_row.get('Peak_RT', '')
@@ -942,7 +980,7 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
     if total_spectra == 0:
         st.warning("⚠️ **No spectra found in MGF files!** Check that MGF files are not empty and are in proper format.")
     elif matched_spectra == 0:
-        st.warning("⚠️ **No spectra matched to compounds!** m/z values in MGF may not match your target compounds (tolerance: ±10 ppm).")
+        st.warning(f"⚠️ **No spectra matched to compounds!** m/z values in MGF may not match your target compounds (tolerance: ±{compound_match_ppm_tolerance} ppm).")
     
     return result_df
 
@@ -1176,13 +1214,32 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
         )
 
         c_name = str(compound_name)
+        
+        # ----------------------------------------------------
+        # Safe Charge (z) Extraction
+        # ----------------------------------------------------
+        raw_z = best_row.get(col_mzmine_charge)
+        if pd.isna(raw_z) or raw_z == "":
+            z_val = 1 if polarity == "Positive" else -1
+        else:
+            try:
+                z_val = int(float(raw_z))
+            except (ValueError, TypeError):
+                z_val = 1 if polarity == "Positive" else -1
+
+        # ----------------------------------------------------
+        # Safe Adduct Formatting (Force brackets e.g. [M+H])
+        # ----------------------------------------------------
+        raw_adduct = best_row.get(_col_gnps_adduct, "")
+        formatted_adduct = format_adduct(raw_adduct, polarity)
+
         result_row = {
             'Compound': c_name[:1].upper() + c_name[1:] if c_name else "",
             'Formula': best_row.get(col_gnps_formula, ""),
             'Polarity': polarity,
-            'Adduct': best_row.get(_col_gnps_adduct, ""),
+            'Adduct': formatted_adduct,
             'm/z': best_row[col_mzmine_mz],
-            'z': best_row.get(col_mzmine_charge, 1 if polarity == "Positive" else -1),
+            'z': z_val,
             'Peak_RT': peak_rt,
             'Exp_Peak_Width_sec': exp_peak_width_sec,
             'Height': best_row[col_mzmine_height],
@@ -1572,7 +1629,8 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Skyline Output Parameters**")
-    fragment_dedup_ppm = st.number_input("Fragment m/z Tolerance (ppm)", min_value=1, max_value=100, value=5, help="Fragments within this ppm tolerance will be deduplicated (keeping the most abundant)")
+    compound_match_ppm_tolerance = st.number_input("Compound Matching Tolerance (ppm)", min_value=1, max_value=100, value=10, help="How close an MGF spectrum's PEPMASS must be to a compound's m/z (in the inclusion list) to be matched to that compound.")
+    fragment_dedup_ppm = st.number_input("Fragment Dedup Tolerance (ppm)", min_value=1, max_value=100, value=5, help="Once a spectrum is matched to a compound, fragment ions within this ppm tolerance of each other are treated as duplicates and only the most abundant one is kept.")
 
     st.divider()
     st.markdown("**Retention Time Window Configuration**")
@@ -1789,6 +1847,7 @@ generate_skyline = st.checkbox("Generate Skyline Mass List? (Extracts fragments 
 mgf_pos_files = []
 mgf_neg_files = []
 if generate_skyline:
+    st.info(f"ℹ️ Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±{compound_match_ppm_tolerance} ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.")
     if polarity_mode in ["Positive & Negative", "Positive Only"]:
         mgf_pos_files = st.file_uploader("GNPS MGF — ESI+ (.mgf)", type=["mgf"], accept_multiple_files=True, key="mgf_pos", help="Consensus MS/MS MGF from GNPS")
     if polarity_mode in ["Positive & Negative", "Negative Only"]:
@@ -2047,24 +2106,31 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
             if mgf_pos_files and not final_pos.empty:
                 try:
                     with st.spinner("📊 Extracting Skyline transitions from ESI+ MGF..."):
-                        skyline_pos = extract_skyline_transitions_from_mgf(mgf_pos_files, final_pos, "Positive", fragment_dedup_ppm)
+                        skyline_pos = extract_skyline_transitions_from_mgf(mgf_pos_files, final_pos, "Positive", fragment_dedup_ppm, compound_match_ppm_tolerance)
                         if not skyline_pos.empty:
                             st.write(f"✓ Extracted {len(skyline_pos)} transitions from ESI+ MGF")
                         else:
                             st.warning("⚠️ No transitions extracted from ESI+ MGF")
                 except Exception as e:
                     st.error(f"❌ Error processing ESI+ MGF: {str(e)}")
+            elif not mgf_pos_files and polarity_mode in ["Positive & Negative", "Positive Only"] and not final_pos.empty:
+                st.info("ℹ️ Skyline requested but no ESI+ MGF file was uploaded — ESI+ Skyline list will be skipped.")
             
             if mgf_neg_files and not final_neg.empty:
                 try:
                     with st.spinner("📊 Extracting Skyline transitions from ESI− MGF..."):
-                        skyline_neg = extract_skyline_transitions_from_mgf(mgf_neg_files, final_neg, "Negative", fragment_dedup_ppm)
+                        skyline_neg = extract_skyline_transitions_from_mgf(mgf_neg_files, final_neg, "Negative", fragment_dedup_ppm, compound_match_ppm_tolerance)
                         if not skyline_neg.empty:
                             st.write(f"✓ Extracted {len(skyline_neg)} transitions from ESI− MGF")
                         else:
                             st.warning("⚠️ No transitions extracted from ESI− MGF")
                 except Exception as e:
                     st.error(f"❌ Error processing ESI− MGF: {str(e)}")
+            elif not mgf_neg_files and polarity_mode in ["Positive & Negative", "Negative Only"] and not final_neg.empty:
+                st.info("ℹ️ Skyline requested but no ESI− MGF file was uploaded — ESI− Skyline list will be skipped.")
+
+            if skyline_pos.empty and skyline_neg.empty:
+                st.warning(f"⚠️ **No Skyline transitions were generated**, so no Skyline_Transition-List file(s) will appear in the ZIP. This happens when: (1) no MGF file was uploaded for a polarity, or (2) none of the MGF spectra's precursor m/z fell within ±{compound_match_ppm_tolerance} ppm of a matched target's m/z (and, if RT was available in the MGF, within that target's RT window). Check the debug log above for exact counts.")
 
         st.session_state['results'] = {
             'pos': final_pos, 'neg': final_neg, 
@@ -2081,6 +2147,7 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
             'hcd_energies': hcd_energies,
             'xic_ppm': xic_ppm_tolerance,
             'fragment_dedup_ppm': fragment_dedup_ppm,
+            'compound_match_ppm_tolerance': compound_match_ppm_tolerance,
             'rt_window_mode': rt_window_mode,
             'rt_margin_min': rt_margin_min,
             'rt_margin_pct': rt_margin_pct
@@ -2140,6 +2207,15 @@ def build_compound_selector(df, key_prefix, title="Select Compounds to Include")
 
 if 'results' in st.session_state:
     r = st.session_state['results']
+    
+    # Check if settings changed since last evaluation
+    settings_changed = False
+    if r.get('resolution') != orbitrap_resolution: settings_changed = True
+    if r.get('it_mode') != it_mode: settings_changed = True
+    if r.get('rt_window_mode') != rt_window_mode: settings_changed = True
+    
+    if settings_changed:
+        st.warning("⚠️ **Settings Modified:** You have changed the sidebar settings. Click '**▶ Evaluate & Optimize Method**' again to recalculate the cycle times and update the figures.")
     
     st.header("📊 Results & Optimization")
     
@@ -2309,9 +2385,9 @@ if 'results' in st.session_state:
             # Download Skyline CSV
             skyline_csv_pos = r['skyline_pos'].to_csv(index=False)
             st.download_button(
-                label="⬇️ Download ESI+ Skyline-Mass-List-Table",
+                label="⬇️ Download Skyline_Transition-List_ESI-pos",
                 data=skyline_csv_pos,
-                file_name="ESI_Positive_Skyline-Mass-List-Table.csv",
+                file_name="Skyline_Transition-List_ESI-pos.csv",
                 mime="text/csv",
                 key="download_skyline_pos"
             )
@@ -2323,9 +2399,9 @@ if 'results' in st.session_state:
             # Download Skyline CSV
             skyline_csv_neg = r['skyline_neg'].to_csv(index=False)
             st.download_button(
-                label="⬇️ Download ESI− Skyline-Mass-List-Table",
+                label="⬇️ Download Skyline_Transition-List_ESI-neg",
                 data=skyline_csv_neg,
-                file_name="ESI_Negative_Skyline-Mass-List-Table.csv",
+                file_name="Skyline_Transition-List_ESI-neg.csv",
                 mime="text/csv",
                 key="download_skyline_neg"
             )
@@ -2342,7 +2418,7 @@ if 'results' in st.session_state:
     # Check if multiplex splitting was used
     has_multiplex = 'Multiplex_Group' in r['pos'].columns if not r['pos'].empty else 'Multiplex_Group' in r['neg'].columns if not r['neg'].empty else False
     
-    if has_multiplex and (not r['pos'].empty or not r['neg'].empty):
+    if has_multiplex and (not r['pos'].empty or not r['neg'].empty) and split_method:
         # MULTIPLEX MODE: Show separate groups
         
         # ESI+ Groups
@@ -2369,9 +2445,9 @@ if 'results' in st.session_state:
                     # Download Group 1
                     thermo_csv_pos_g1 = create_thermo_fisher_csv(pos_group1, r['rt_window_mode'])
                     st.download_button(
-                        label="⬇️ Download Group 1 (Thermo Format)",
+                        label="⬇️ Download Group 1 (Exploris Format)",
                         data=thermo_csv_pos_g1,
-                        file_name="ESI_Positive_Group1_Inclusion_List.csv",
+                        file_name="Exploris_Inclusion-List_ESI-pos_Group1.csv",
                         mime="text/csv",
                         key="download_pos_g1_thermo"
                     )
@@ -2394,9 +2470,9 @@ if 'results' in st.session_state:
                     # Download Group 2
                     thermo_csv_pos_g2 = create_thermo_fisher_csv(pos_group2, r['rt_window_mode'])
                     st.download_button(
-                        label="⬇️ Download Group 2 (Thermo Format)",
+                        label="⬇️ Download Group 2 (Exploris Format)",
                         data=thermo_csv_pos_g2,
-                        file_name="ESI_Positive_Group2_Inclusion_List.csv",
+                        file_name="Exploris_Inclusion-List_ESI-pos_Group2.csv",
                         mime="text/csv",
                         key="download_pos_g2_thermo"
                     )
@@ -2429,9 +2505,9 @@ if 'results' in st.session_state:
                     # Download Group 1
                     thermo_csv_neg_g1 = create_thermo_fisher_csv(neg_group1, r['rt_window_mode'])
                     st.download_button(
-                        label="⬇️ Download Group 1 (Thermo Format)",
+                        label="⬇️ Download Group 1 (Exploris Format)",
                         data=thermo_csv_neg_g1,
-                        file_name="ESI_Negative_Group1_Inclusion_List.csv",
+                        file_name="Exploris_Inclusion-List_ESI-neg_Group1.csv",
                         mime="text/csv",
                         key="download_neg_g1_thermo"
                     )
@@ -2454,9 +2530,9 @@ if 'results' in st.session_state:
                     # Download Group 2
                     thermo_csv_neg_g2 = create_thermo_fisher_csv(neg_group2, r['rt_window_mode'])
                     st.download_button(
-                        label="⬇️ Download Group 2 (Thermo Format)",
+                        label="⬇️ Download Group 2 (Exploris Format)",
                         data=thermo_csv_neg_g2,
-                        file_name="ESI_Negative_Group2_Inclusion_List.csv",
+                        file_name="Exploris_Inclusion-List_ESI-neg_Group2.csv",
                         mime="text/csv",
                         key="download_neg_g2_thermo"
                     )
@@ -2484,9 +2560,9 @@ if 'results' in st.session_state:
                     # Thermo Fisher format download
                     thermo_csv_pos = create_thermo_fisher_csv(pos_filtered, r['rt_window_mode'])
                     st.download_button(
-                        label="⬇️ Download ESI+ (Thermo Format)",
+                        label="⬇️ Download ESI+ (Exploris Format)",
                         data=thermo_csv_pos,
-                        file_name="ESI_Positive_Inclusion_List.csv",
+                        file_name="Exploris_Inclusion-List_ESI-pos.csv",
                         mime="text/csv",
                         key="download_pos_thermo"
                     )
@@ -2511,9 +2587,9 @@ if 'results' in st.session_state:
                     # Thermo Fisher format download
                     thermo_csv_neg = create_thermo_fisher_csv(neg_filtered, r['rt_window_mode'])
                     st.download_button(
-                        label="⬇️ Download ESI− (Thermo Format)",
+                        label="⬇️ Download ESI− (Exploris Format)",
                         data=thermo_csv_neg,
-                        file_name="ESI_Negative_Inclusion_List.csv",
+                        file_name="Exploris_Inclusion-List_ESI-neg.csv",
                         mime="text/csv",
                         key="download_neg_thermo"
                     )
