@@ -2243,9 +2243,7 @@ if st.session_state.input_mode == "Manual Input":
             help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires MGF files to be uploaded below.",
             key="skyline_manual"
         )
-        if generate_skyline:
-            st.info("Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.")
-            
+
         if generate_skyline != st.session_state.generate_skyline:
             st.session_state.generate_skyline = generate_skyline
             st.rerun()
@@ -2310,18 +2308,19 @@ elif st.session_state.input_mode == "GNPS2 Task ID":
                     }
                     st.success(f"✓ Successfully fetched data for Task ID: {task_id}")
                 except Exception as e:
-                    st.error(f"Error fetching data: {str(e)}")
+                    st.error(f"Error fetching data. Try again with a different Task ID.")
 
 else: # Test Data Mode
     # st.divider()
     st.radio(label="Select Input Mode", options=["Option 1: Manual Input Test Data", "Option 2: GNPS2 Task ID Test Data"], index=0, key="test_data_mode", on_change=reset_all_outputs)
 
     # Define paths
-    base_path = "Manual Test Data/"
+    base_path = "Manual_Test_Data/"
     path_compounds = base_path + "Compounds_Completed.csv"
     path_gnps = base_path + "Mix_179Xeno_pos_gnps.csv"
     path_mzmine = base_path + "Mix_179Xeno_pos_quant_full.csv"
     path_mzml = base_path + "Mix_179Xeno_5ugml_pos_01.mzML"
+    path_mgf = base_path + "Consensus_MS-MS_MGF_pos.mgf"
 
     if st.session_state.test_data_mode == "Option 1: Manual Input Test Data":
         try:
@@ -2329,13 +2328,29 @@ else: # Test Data Mode
             f_gnps_pos = [open(path_gnps, "rb")]
             f_mzmine_pos = [open(path_mzmine, "rb")]
             f_mzml_pos = open(path_mzml, "rb")
+            f_mgf_pos = [open(path_mgf, "rb")]
             
             c1, c2 = st.columns(2); c3, c4 = st.columns(2)
             with c1: st.success("✓ Loaded test compounds")
             with c2: st.success("✓ Loaded test GNPS+")
             with c3: st.success("✓ Loaded test MZmine+")
             with c4: st.success("✓ Loaded test mzML")
-            
+
+            generate_skyline = st.checkbox("Generate Skyline Mass List? (Extracts fragments from MGF)",
+                value = True,
+                help ="Extracts fragment ions from MGF spectra for direct Skyline import. Requires MGF files to be uploaded.",
+                disabled = True, 
+                key = "skyline_test_manual"
+            )
+
+            st.success("✓ Loaded test MGF+")
+
+            if generate_skyline != st.session_state.generate_skyline:
+                st.session_state.generate_skyline = generate_skyline
+                st.rerun()
+
+            fetch_mgf_choice = generate_skyline
+
             f_gnps_neg, f_mzmine_neg, f_mzml_neg = None, None, None
 
         except FileNotFoundError as e:
@@ -2478,7 +2493,10 @@ fetched = st.session_state.get('gnps_data_fetched')
 mgf_state = "✗ Not fetched"
 target_id = "20a59d94003c41168a5186a00e2ac086" if current_mode == "Test Data" else st.session_state.get('gnps_task_id')
 
-if fetched and fetched.get('task_id') == target_id:
+if current_mode == "Test Data" and st.session_state.test_data_mode == "Option 1: Manual Input Test Data":
+    if f_mgf_pos:
+        mgf_state = "✓ MGF Loaded"
+elif fetched and fetched.get('task_id') == target_id:
     if fetched.get('mgf_content'):
         mgf_state = "✓ MGF Fetched"
     elif fetched.get('mgf_fetched'):
@@ -2833,7 +2851,14 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
         skyline_pos = pd.DataFrame()
         skyline_neg = pd.DataFrame()
         
-        if generate_skyline:
+        if generate_skyline or mgf_pos_files or mgf_neg_files:
+            # Check for manual skyline MGF input in Test Data mode
+            if st.session_state.input_mode == "Test Data" and st.session_state.test_data_mode == "Option 1: Manual Input Test Data":
+                if st.session_state.get('manual_skyline_mgf_input', False):
+                    # Use the pre-loaded f_mgf_pos if the manual skyline checkbox is checked
+                    mgf_pos_files = f_mgf_pos
+                    st.write("✓ Using `f_mgf_pos` as Skyline MGF input.")
+            
             if mgf_pos_files and not final_pos.empty:
                 try:
                     with st.spinner("📊 Extracting Skyline transitions from ESI+ MGF..."):

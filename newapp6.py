@@ -19,7 +19,7 @@ import urllib
 import requests
 
 st.set_page_config(
-    page_title="Quant-GNPS2 | PRM Method Generator",
+    page_title="GNPS2-Quant | PRM Method Generator",
     page_icon="🔬",
     layout="wide"
 )
@@ -47,10 +47,21 @@ GNPS2_QUANT_TABLE_PATHS = [
 ]
 
 GNPS2_MGF_PATHS = [
-    "nf_output/clustering/spectra_reformatted.mgf",  # requested by user as primary
-    "nf_output/clustering/specs_ms.mgf",             # primary consensus MS/MS spectra written by FBMN/Everything Bagel
-    "nf_output/network_overlay/specs_ms.mgf",        # fallback seen on some task configurations
+    "nf_output/feature_finding/aligned_features_filled.mgf" 
+    #"nf_output/clustering/spectra_reformatted.mgf"  # requested by user as primary
+    #"nf_output/clustering/specs_ms.mgf",             # primary consensus MS/MS spectra written by FBMN/Everything Bagel
+    #"nf_output/network_overlay/specs_ms.mgf",        # fallback seen on some task configurations
 ]
+
+GNPS2_FEATURE_LIBRARY_PATHS = [
+    "nf_output/feature_library_search/merged_feature_library_results.tsv"
+]
+
+GNPS2_RT_BOUNDS_PATHS = [
+    "nf_output/feature_finding/feature_finding_results/aligned_rt_bounds.csv"
+]
+
+
 
 
 def _fetch_gnps2_file_bytes(task_id, result_path):
@@ -231,6 +242,7 @@ def load_gnps_task_data(task_id, fetch_mgf=True):
             )
 
     return gnps_df, mzmine_df, mgf_content, True
+
 
 # =============================================================================
 # Default Column Mappings
@@ -2068,7 +2080,7 @@ def reset_all_outputs():
 # data processing parameters, column mappings, and the main data input methods
 # (manual upload, GNPS2 Task ID, or test data).
 try:
-    st.set_page_config(page_title="Quant-GNPS2 | PRM Method Generator", page_icon="🔬", layout="wide")
+    st.set_page_config(page_title="GNPS2-Quant | PRM Method Generator", page_icon="🔬", layout="wide")
 except Exception:
     pass
 
@@ -2243,10 +2255,10 @@ with st.sidebar:
             st.session_state.col_targets_smiles = st.text_input("Target SMILES", value=st.session_state.col_targets_smiles, key="input_targets_smiles", help="Optional: Column for SMILES")
             st.session_state.col_targets_formula = st.text_input("Target Formula", value=st.session_state.col_targets_formula, key="input_targets_formula", help="Optional: Column for formula")
 
-st.title("🔬 Quant-GNPS2 Method Optimizer")
-with st.expander("ℹ️ About Quant-GNPS2 Method Optimizer", expanded=True):
+st.title("🔬 GNPS2-Quant Method Optimizer")
+with st.expander("ℹ️ About GNPS2-Quant Method Optimizer", expanded=True):
     st.markdown("""
-    **Quant-GNPS2** is your go-to platform for generating high-quality **Parallel Reaction Monitoring (PRM) Inclusion Lists**.
+    **GNPS2-Quant** is your go-to platform for generating high-quality **Parallel Reaction Monitoring (PRM) Inclusion Lists**.
     It helps you optimize 'Points-Per-Peak' before exporting your Thermo Exploris 480 Inclusion Lists.
     
     **The Core Workflow:** Match your Data-Dependent Acquisition (DDA) experiment results (from **GNPS2 spectral libraries** and **MZmine 3 feature tables**) against your target compound list.
@@ -2274,7 +2286,7 @@ if "generate_skyline" not in st.session_state:
 if 'gnps_data_fetched' not in st.session_state:
     st.session_state['gnps_data_fetched'] = None
 
-st.radio("Input Method", options=["Manual Input", "GNPS2 Task ID", "Test Data"], index=0, key="input_mode", help="Choose how to provide your data for processing", horizontal = True)
+st.radio("Input Method", options=["Manual Input", "GNPS2 Task ID", "Everything Bagel Task ID", "Test Data"], index=0, key="input_mode", help="Choose how to provide your data for processing", horizontal = True)
 
 generate_skyline = st.session_state.generate_skyline
     
@@ -2427,6 +2439,32 @@ elif st.session_state.input_mode == "GNPS2 Task ID":
                     st.success(f"✓ Successfully fetched data for Task ID: {task_id}")
                 except Exception as e:
                     st.error(f"Error fetching data: {str(e)}")
+elif st.session_state.input_mode == "Everything Bagel Task ID":
+    step1, step2 = st.tabs(["Step 1: Upload Target Compound List & Optional LC-MS Data", "Step 2: Enter Everything Bagel Task ID"])
+    with step1: 
+        st.subheader("📋 Step 1: Upload Target Compound List & Optional LC-MS Data")
+        st.markdown("""This is your **internal reference library** — the compounds you want to target in your PRM method. You can also optionally upload your LC-MS raw data in mzML format for XIC extraction.""")
+        c1, c2, c3 = st.columns(3)
+        with c1: 
+            f_compounds = st.file_uploader("Compounds.csv (Required)", type=["csv"], key="compounds_upload")
+        with c2: 
+            f_mzml_pos = None
+            f_mzml_neg = None
+            if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                f_mzml_pos = st.file_uploader("LC-MS Raw Data (.mzML) — ESI+", type=["mzML", "mzml"], key="mzml_pos", help="Leave empty to skip XIC extraction (speeds up processing)")
+        with c3:    
+            if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                f_mzml_neg = st.file_uploader("LC-MS Raw Data (.mzML) — ESI−", type=["mzML", "mzml"], key="mzml_neg", help="Leave empty to skip XIC extraction (speeds up processing)")
+
+    with step2: 
+        st.subheader("📁 Step 2: Enter Everything Bagel Task ID")
+        task_id = st.text_input("Everything Bagel Task ID", placeholder="Enter Everything Bagel Task ID (e.g., 1234567890abcdef)", key="bagel_task_id")
+        generate_skyline = st.checkbox(
+            "Generate Skyline Mass List? (Extracts fragments from MGF)",
+            value=st.session_state.generate_skyline,
+            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires fetching the Consensus MS/MS MGF from Everything Bagel.",
+            key="skyline_bagel"
+        )
 
 else: # Test Data Mode
     # st.divider()

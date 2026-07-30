@@ -25,26 +25,18 @@ st.set_page_config(
 )
 
 # =============================================================================
-# GNPS DATA FETCHING HELPERS
+# GNPS Data Fetching Utilities
 # =============================================================================
 #
-# NOTE on FBMN vs "Everything Bagel":
-# On GNPS2, "Everything Bagel" is not a separate workflow with its own output
-# structure -- it is simply the value of the FBMN pipeline's internal
-# `--featurefindingtool` parameter (EVERYTHING_BAGEL vs MZMINE vs OPENMS, etc.).
-# Both feature-finding tools are routed through the exact same MZmine-style
-# reformatting step and land in the exact same nf_output/ locations. So the
-# same candidate paths below work for both FBMN and Everything Bagel task IDs.
+# This section provides helper functions to fetch data from GNPS2 tasks.
+# It handles the nuances of different GNPS2 workflows like FBMN and "Everything Bagel",
+# which share similar output structures, ensuring compatibility.
 #
-# Whether the resulting quantification file includes RT peak boundaries
-# (rt_range:min / rt_range:max) and peak-width (fwhm) columns depends on
-# whether the *original* MZmine export that was fed into the task was the
-# "full"/quant_full feature table or the minimal GNPS export. The reformatting
-# step does not drop columns, so if they were present going in, they'll be
-# present in nf_output/clustering/featuretable_reformated.csv coming out.
-# When they're not present, process_polarity() below falls back to using the
-# apex RT for both bounds so the app still produces usable RT windows instead
-# of crashing.
+# A key consideration is the presence of RT peak boundaries (rt_range:min / rt_range:max)
+# and peak-width (fwhm) columns in the quantification files. These depend on the
+# original MZmine export used in the GNPS task. If these columns are missing,
+# the application gracefully falls back to using apex retention time (RT) for calculations,
+# preventing crashes and still allowing for RT window generation.
 
 GNPS2_LIBRARY_RESULTS_PATHS = [
     "nf_output/library/merged_results_with_gnps.tsv",
@@ -55,18 +47,29 @@ GNPS2_QUANT_TABLE_PATHS = [
 ]
 
 GNPS2_MGF_PATHS = [
-    "nf_output/clustering/spectra_reformatted.mgf",  # requested by user as primary
-    "nf_output/clustering/specs_ms.mgf",             # primary consensus MS/MS spectra written by FBMN/Everything Bagel
-    "nf_output/network_overlay/specs_ms.mgf",        # fallback seen on some task configurations
+    "nf_output/feature_finding/aligned_features_filled.mgf" 
+    #"nf_output/clustering/spectra_reformatted.mgf"  # requested by user as primary
+    #"nf_output/clustering/specs_ms.mgf",             # primary consensus MS/MS spectra written by FBMN/Everything Bagel
+    #"nf_output/network_overlay/specs_ms.mgf",        # fallback seen on some task configurations
 ]
+
+GNPS2_FEATURE_LIBRARY_PATHS = [ #feature library search results (annotations) for Everything Bagel
+    "nf_output/feature_library_search/merged_feature_library_search_results.tsv"
+]
+
+GNPS2_RT_BOUNDS_PATHS = [ #feature quantification table with RT bounds (min/max) for each feature
+    "nf_output/feature_finding/feature_finding_results/aligned_rt_bounds.csv"
+]
+
+
 
 
 def _fetch_gnps2_file_bytes(task_id, result_path):
     """
-    Fetch raw bytes for a single GNPS2 task result file, trying the prod/beta/de
-    mirrors (the same fallback pattern gnpsdata.taskresult uses internally for
-    dataframe fetches, but for arbitrary binary/text files like MGFs).
-    Returns bytes on success, or None if the file couldn't be retrieved from any mirror.
+    Fetches raw file content (bytes) from a GNPS2 task result.
+    It attempts to retrieve the file from various GNPS2 server mirrors (production, beta, Germany)
+    to ensure robustness. This is useful for non-dataframe files like MGFs.
+    Returns the file content as bytes on success, or None if retrieval fails across all mirrors.
     """
     for server in ["prod", "beta", "de"]:
         try:
@@ -79,12 +82,13 @@ def _fetch_gnps2_file_bytes(task_id, result_path):
             continue
     return None
 
-
 def _fetch_gnps2_dataframe_multi(task_id, candidate_paths, delimiter="\t"):
     """
-    Try a list of candidate result-file paths (in priority order) for a GNPS2 task,
-    returning the first one that successfully parses as a non-empty dataframe.
-    Returns (dataframe, matched_path) or (None, None) if nothing worked.
+    Attempts to fetch and parse a GNPS2 task result file into a pandas DataFrame.
+    It iterates through a list of `candidate_paths` in priority order, returning the
+    first one that successfully yields a non-empty DataFrame.
+    Returns a tuple of (dataframe, matched_path) on success, or (None, None) if no valid
+    dataframe can be retrieved from any of the provided paths.
     """
     for path in candidate_paths:
         try:
@@ -95,12 +99,13 @@ def _fetch_gnps2_dataframe_multi(task_id, candidate_paths, delimiter="\t"):
             continue
     return None, None
 
-
 def _fetch_gnps2_bytes_multi(task_id, candidate_paths):
     """
-    Try a list of candidate result-file paths (in priority order) for a GNPS2 task,
-    returning the first one that returns non-empty bytes.
-    Returns (bytes, matched_path) or (None, None).
+    Attempts to fetch raw file content (bytes) from a GNPS2 task result.
+    It tries a list of `candidate_paths` in priority order, returning the
+    first one that yields non-empty bytes.
+    Returns a tuple of (bytes, matched_path) on success, or (None, None) if no content
+    can be retrieved from any of the provided paths.
     """
     for path in candidate_paths:
         content = _fetch_gnps2_file_bytes(task_id, path)
@@ -108,11 +113,11 @@ def _fetch_gnps2_bytes_multi(task_id, candidate_paths):
             return content, path
     return None, None
 
-
 def _fetch_mgf_with_provided_logic(task_id, is_gnps2=True):
     """
-    Uses the user-provided logic (download functions from gnpsdata) 
-    to retrieve the MGF file content.
+    Retrieves the MGF file content using predefined GNPS data download logic.
+    It attempts to download from specific GNPS2 or GNPS1 paths and handles temporary file creation.
+    Returns the MGF content as bytes on success, or None if retrieval fails.
     """
     import tempfile
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mgf") as tmp:
@@ -137,9 +142,13 @@ def _fetch_mgf_with_provided_logic(task_id, is_gnps2=True):
             os.remove(tmp_path)
     return None
 
-
 def _load_gnps1_task_data(task_id, fetch_mgf=True):
-    """GNPS1 (legacy proteomics2.ucsd.edu) fallback. Returns (gnps_df, mzmine_df, mgf_content, is_gnps2=False)."""
+    """
+    Loads data from a legacy GNPS1 task (proteomics2.ucsd.edu).
+    It fetches quantification and library results, and optionally the Consensus MS/MS MGF.
+    This function acts as a fallback for task IDs not found on GNPS2.
+    Returns a tuple of (gnps_df, mzmine_df, mgf_content, is_gnps2=False).
+    """
     ft_url = f"https://proteomics2.ucsd.edu/ProteoSAFe/DownloadResultFile?task={task_id}&file=quantification_table_reformatted/&block=main"
     an_url = f"https://proteomics2.ucsd.edu/ProteoSAFe/DownloadResultFile?task={task_id}&file=DB_result/&block=main"
 
@@ -171,7 +180,6 @@ def _load_gnps1_task_data(task_id, fetch_mgf=True):
 
     return gnps_df, mzmine_df, mgf_content, False
 
-
 def load_gnps_task_data(task_id, fetch_mgf=True):
     """
     Fetches required data from a GNPS2 task ID (FBMN or "Everything Bagel" --
@@ -196,7 +204,7 @@ def load_gnps_task_data(task_id, fetch_mgf=True):
     rt_start_found = find_column_ci(mzmine_df, MZMINE_RT_START_COL) in mzmine_df.columns
     rt_end_found = find_column_ci(mzmine_df, MZMINE_RT_END_COL) in mzmine_df.columns
     if rt_start_found and rt_end_found:
-        st.write("&nbsp;&nbsp;&nbsp;&nbsp;↳ RT boundary columns found (`rt_range:min` / `rt_range:max`) — full peak boundaries available.")
+        st.write("↳ RT boundary columns found (`rt_range:min` / `rt_range:max`) — full peak boundaries available.")
     else:
         st.info("ℹ️ No RT boundary columns in this quantification file")
 
@@ -235,9 +243,81 @@ def load_gnps_task_data(task_id, fetch_mgf=True):
 
     return gnps_df, mzmine_df, mgf_content, True
 
+def load_eb_task_data(task_id, fetch_mgf=True):
+    """
+    Fetches required data from an "Everything Bagel" (EB) GNPS2 task ID.
+
+    Everything Bagel runs its own feature finding step, so there's no MZmine export and no
+    scan-based library search to pull -- instead we go straight to GNPS2 for:
+      1. RT bounds (`GNPS2_RT_BOUNDS_PATHS`)            -- stands in for the MZmine quant table
+      2. Feature library search results (`GNPS2_FEATURE_LIBRARY_PATHS`) -- stands in for the
+         GNPS library results
+      3. Consensus MS/MS MGF (`GNPS2_MGF_PATHS`)
+
+    This mirrors `load_gnps_task_data`, but skips the GNPS1 fallback (Everything Bagel is a
+    GNPS2-only workflow) and skips `_fetch_mgf_with_provided_logic` (that helper targets FBMN's
+    `nf_output/clustering/` path, which doesn't exist for Everything Bagel).
+
+    Returns (gnps_df, mzmine_df, mgf_content, is_gnps2), the same shape as
+    `load_gnps_task_data`, so it's a drop-in replacement anywhere GNPS2 task data is consumed:
+      - gnps_df   -> Feature Library Results (annotations)
+      - mzmine_df -> RT Bounds table (feature id + rt_range:min / rt_range:max, plus whatever
+                     other columns the export includes)
+      - is_gnps2  -> always True (Everything Bagel is always a GNPS2 workflow)
+    """
+    # 1. RT Bounds -- used as the signal that this is a reachable Everything Bagel task.
+    rt_bounds_df, rt_bounds_path = _fetch_gnps2_dataframe_multi(task_id, GNPS2_RT_BOUNDS_PATHS, delimiter=",")
+
+    if rt_bounds_df is None:
+        raise Exception(
+            f"Failed to fetch data for Everything Bagel Task ID {task_id}. Tried RT Bounds path(s) "
+            f"({', '.join(GNPS2_RT_BOUNDS_PATHS)}). Please double check the Task ID and that the "
+            f"Everything Bagel workflow completed successfully on GNPS2."
+        )
+
+    st.write(f"✓ Successfully pulled RT Bounds")
+    rt_start_found = find_column_ci(rt_bounds_df, MZMINE_RT_START_COL) in rt_bounds_df.columns
+    rt_end_found = find_column_ci(rt_bounds_df, MZMINE_RT_END_COL) in rt_bounds_df.columns
+    if rt_start_found and rt_end_found:
+        st.write("↳ RT boundary columns found (`rt_range:min` / `rt_range:max`) — full peak boundaries available.")
+    else:
+        st.info("ℹ️ No RT boundary columns in this RT Bounds file")
+
+    # 2. Feature Library Results (Annotations) -- since RT Bounds were found, this is confirmed to
+    #    be a reachable Everything Bagel task, so we no longer treat a failure here as "wrong task
+    #    ID" -- it points at this specific file/step instead.
+    gnps_df, lib_path = _fetch_gnps2_dataframe_multi(task_id, GNPS2_FEATURE_LIBRARY_PATHS, delimiter="\t")
+    if gnps_df is None:
+        raise Exception(
+            f"Task {task_id} was found on GNPS2 (RT Bounds retrieved from `{rt_bounds_path}`), "
+            f"but the Feature Library Results file could not be retrieved from "
+            f"`{GNPS2_FEATURE_LIBRARY_PATHS[0]}`. This can happen if no spectral library was selected "
+            f"for this job, or if the feature library search step failed/is still running."
+        )
+    st.write(f"✓ Successfully pulled Feature Library Results")
+
+    # 3. Consensus MS/MS MGF (Conditional)
+    mgf_content = None
+    if fetch_mgf:
+        mgf_content, mgf_path = _fetch_gnps2_bytes_multi(task_id, GNPS2_MGF_PATHS)
+        if mgf_content:
+            st.write(f"✓ Successfully pulled Consensus MS/MS MGF")
+        else:
+            st.warning(
+                "⚠️ Could not find Consensus MS/MS MGF in Everything Bagel task output. Tried: "
+                + ", ".join(f"`{p}`" for p in GNPS2_MGF_PATHS)
+            )
+
+    return gnps_df, rt_bounds_df, mgf_content, True
+
+
 # =============================================================================
-# DEFAULT COLUMN MAPPING CONSTANTS
+# Default Column Mappings
 # =============================================================================
+#
+# These constants define the default column names expected in the input dataframes
+# (GNPS, MZmine, and Target Compounds). They serve as a baseline for the application's
+# data processing, but can be customized by the user in the sidebar's "Advanced: Column Mappings" section.
 GNPS_COMPOUND_COL = "Compound_Name"
 GNPS_SCAN_COL = "#Scan#"
 GNPS_FORMULA_COL = "molecular_formula"
@@ -259,10 +339,20 @@ TARGETS_SMILES_COL = "SMILES"
 TARGETS_FORMULA_COL = "Formula"
 
 # =============================================================================
-# COLUMN MAPPING HELPER
+# Column Mapping Helpers
 # =============================================================================
+#
+# These helper functions assist in robustly identifying and validating column names
+# within dataframes, accommodating for case-insensitivity and common aliases.
+# This ensures that the application can correctly interpret user-provided data
+# even if column names vary slightly from the defaults.
 def get_col_mapping():
-    """Get current column mappings from session state or use defaults"""
+    """Get current column mappings from session state or use defaults.
+    This function retrieves the active column mapping configuration, allowing users to customize
+    column names through the Streamlit session state. If no custom mapping is provided for a column,
+    it falls back to the predefined default column names.
+    Returns a dictionary mapping generic column identifiers to their actual (user-defined or default) names.
+    """
     import streamlit as st
     
     mapping = {
@@ -288,9 +378,10 @@ def get_col_mapping():
 
 def find_column_ci(df, col_name):
     """
-    Find a column in a dataframe case-insensitively.
-    Also handles common aliases for MZmine/GNPS columns.
-    Returns the actual column name if found, otherwise returns the original col_name.
+    Searches for a column in a pandas DataFrame case-insensitively and handles common aliases.
+    This function provides a robust way to locate columns, even if their capitalization or
+    specific naming conventions differ from the expected.
+    Returns the actual column name if found, otherwise returns the original `col_name`.
     """
     if col_name in df.columns:
         return col_name
@@ -309,8 +400,8 @@ def find_column_ci(df, col_name):
         "rt": ["row retention time", "row_rt", "retention time", "retention_time", "scan_rt", "rt (min)"],
         "rt_range:min": ["row_rt_min", "rt_min", "min_rt", "rtstart", "t start (min)", "rt_range:min"],
         "rt_range:max": ["row_rt_max", "rt_max", "max_rt", "rtstop", "t stop (min)", "rt_range:max"],
-        "compound_name": ["compound", "compound name", "name", "metabolite", "identification", "standardized_compound"],
-        "#scan#": ["id", "scan", "scan#", "feature_id", "feature id", "row id", "row_id"],
+        "compound_name": ["compound", "compound name", "name", "metabolite", "identification", "standardized_compound", "compound_name"],
+        "#scan#": ["id", "scan", "scan#", "feature_id", "feature id", "row id", "row_id", "query_scan", "#scan#"],
         "molecular_formula": ["formula", "mf", "chemical_formula"],
         "adduct": ["precursor_type", "ion", "ion_type"],
         "cas_number": ["cas", "cas_no", "cas#"],
@@ -336,9 +427,11 @@ def find_column_ci(df, col_name):
 
 def validate_columns_ci(df, required_cols, df_name="dataframe"):
     """
-    Validate required columns exist (case-insensitive).
-    Returns a dict mapping user-specified names to actual column names in the dataframe.
-    Raises ValueError if any required columns are missing.
+    Validates the presence of required columns in a DataFrame, checking case-insensitively.
+    This function ensures that all essential columns are present before proceeding with data processing,
+    providing clear error messages if any are missing.
+    Returns a dictionary mapping the user-specified column names to their actual names in the DataFrame.
+    Raises a `ValueError` if any required columns are not found.
     """
     col_mapping = {}
     missing_cols = []
@@ -360,16 +453,19 @@ def validate_columns_ci(df, required_cols, df_name="dataframe"):
     return col_mapping
 
 # =============================================================================
-# HELPER FUNCTIONS
+# General Helper Functions
 # =============================================================================
+#
+# This section contains a collection of general utility functions that support
+# various data processing, formatting, and reporting tasks throughout the application.
 
 def create_thermo_fisher_csv(df, rt_window_mode='composite_margin'):
-    """Creates Thermo Fisher format CSV for inclusion lists
-    
-    Supports modes:
-    - composite_margin/symmetric_margin/fwhm_margin/hybrid etc: t start (min), t stop (min)
-    - rt_window: RT Time (min), Window (min)
-    - unscheduled: No RT information
+    """
+    Generates a CSV file formatted specifically for Thermo Fisher mass spectrometers,
+    suitable for inclusion lists. The output format adapts based on the selected
+    retention time window mode (e.g., 'Start/End Time', 'Retention Time Window',
+    or 'Unscheduled'). This ensures compatibility with different instrument acquisition methods.
+    Returns the CSV content as a string.
     """
     if df.empty:
         return ""
@@ -402,8 +498,11 @@ def create_thermo_fisher_csv(df, rt_window_mode='composite_margin'):
 
 def create_pdf_report(results_dict):
     """
-    Creates a comprehensive PDF report with all figures, match statistics, and settings.
-    Returns PDF as bytes.
+    Generates a comprehensive PDF report summarizing the PRM method optimization.
+    The report includes instrument and method settings, match statistics, multiplex group distribution,
+    and various figures (Points Per Peak, Concurrency, RT Alignment). It also provides notes
+    on interactive Plotly visualizations and XIC figures available in the ZIP file.
+    Returns the PDF content as bytes.
     """
     try:
         from reportlab.lib.pagesizes import letter, A4
@@ -412,6 +511,7 @@ def create_pdf_report(results_dict):
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.enums import TA_CENTER, TA_LEFT
         from reportlab.lib import colors
+        from reportlab.lib.utils import ImageReader
         from datetime import datetime
     except ImportError:
         return None
@@ -455,6 +555,17 @@ def create_pdf_report(results_dict):
        ('Multiplex_Group' in neg_df.columns and neg_df['Multiplex_Group'].nunique() > 1):
         has_multiplex = True
     
+    rt_margin_min_val = results_dict.get('rt_margin_min')
+    rt_margin_pct_val = results_dict.get('rt_margin_pct')
+    if rt_margin_min_val is not None and rt_margin_pct_val is not None:
+        rt_margin_display = f"{rt_margin_min_val} min / {rt_margin_pct_val}%"
+    elif rt_margin_pct_val is not None:
+        rt_margin_display = f"{rt_margin_pct_val}%"
+    elif rt_margin_min_val is not None:
+        rt_margin_display = f"{rt_margin_min_val} min"
+    else:
+        rt_margin_display = 'N/A'
+
     settings_data = [
         ['Setting', 'Value'],
         ['Polarity Mode', results_dict.get('mode', 'N/A')],
@@ -465,7 +576,7 @@ def create_pdf_report(results_dict):
         ['Compound Matching Tolerance (ppm)', str(results_dict.get('compound_match_ppm_tolerance', 'N/A'))],
         ['Fragment Dedup Tolerance (ppm)', str(results_dict.get('fragment_dedup_ppm', 'N/A'))],
         ['RT Window Mode', results_dict.get('rt_window_mode', 'N/A')],
-        ['RT Margin (min)', str(results_dict.get('rt_margin', 'N/A'))],
+        ['RT Margin', rt_margin_display],
         ['Multiplex Splitting', 'YES — Two Inclusion Lists' if has_multiplex else 'NO — Single Inclusion List'],
     ]
     settings_table = Table(settings_data, colWidths=[2.5*inch, 3.5*inch])
@@ -547,14 +658,30 @@ def create_pdf_report(results_dict):
     # Add figures
     figure_count = 0
     
+    # Helper to create auto-sized Image
+    def get_auto_scaled_image(img_buf):
+        img_buf.seek(0)
+        img_reader = ImageReader(img_buf)
+        img_w_px, img_h_px = img_reader.getSize()
+        img_buf.seek(0)
+        
+        # Calculate size in inches based on 150 DPI
+        w_inch = img_w_px / 150.0
+        h_inch = img_h_px / 150.0
+        
+        # Max dimensions for letter page with 0.5 inch margins (with some room for title)
+        max_w_inch = 7.5
+        max_h_inch = 9.0
+        
+        scale = min(1.0, max_w_inch / w_inch, max_h_inch / h_inch)
+        return Image(img_buf, width=w_inch * scale * inch, height=h_inch * scale * inch)
+
     # Points Per Peak figures
     for idx, (grp, fig) in enumerate(results_dict.get('fp_pos', [])):
-        if figure_count > 0 and figure_count % 2 == 0:
-            story.append(PageBreak())
+        story.append(PageBreak())
         img_buffer = io.BytesIO()
         fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-        img_buffer.seek(0)
-        img = Image(img_buffer, width=4.5*inch, height=2.8*inch)
+        img = get_auto_scaled_image(img_buffer)
         story.append(Paragraph(f"ESI+ Points Per Peak (Group {grp})", heading_style))
         story.append(img)
         story.append(Spacer(1, 0.15*inch))
@@ -562,12 +689,10 @@ def create_pdf_report(results_dict):
         plt.close(fig)
     
     for idx, (grp, fig) in enumerate(results_dict.get('fp_neg', [])):
-        if figure_count > 0 and figure_count % 2 == 0:
-            story.append(PageBreak())
+        story.append(PageBreak())
         img_buffer = io.BytesIO()
         fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-        img_buffer.seek(0)
-        img = Image(img_buffer, width=4.5*inch, height=2.8*inch)
+        img = get_auto_scaled_image(img_buffer)
         story.append(Paragraph(f"ESI− Points Per Peak (Group {grp})", heading_style))
         story.append(img)
         story.append(Spacer(1, 0.15*inch))
@@ -576,12 +701,10 @@ def create_pdf_report(results_dict):
     
     # Concurrency figures
     for idx, (grp, fig) in enumerate(results_dict.get('fc_pos', [])):
-        if figure_count > 0 and figure_count % 2 == 0:
-            story.append(PageBreak())
+        story.append(PageBreak())
         img_buffer = io.BytesIO()
         fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-        img_buffer.seek(0)
-        img = Image(img_buffer, width=4.5*inch, height=2.8*inch)
+        img = get_auto_scaled_image(img_buffer)
         story.append(Paragraph(f"ESI+ Concurrency (Group {grp})", heading_style))
         story.append(img)
         story.append(Spacer(1, 0.15*inch))
@@ -589,12 +712,10 @@ def create_pdf_report(results_dict):
         plt.close(fig)
     
     for idx, (grp, fig) in enumerate(results_dict.get('fc_neg', [])):
-        if figure_count > 0 and figure_count % 2 == 0:
-            story.append(PageBreak())
+        story.append(PageBreak())
         img_buffer = io.BytesIO()
         fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-        img_buffer.seek(0)
-        img = Image(img_buffer, width=4.5*inch, height=2.8*inch)
+        img = get_auto_scaled_image(img_buffer)
         story.append(Paragraph(f"ESI− Concurrency (Group {grp})", heading_style))
         story.append(img)
         story.append(Spacer(1, 0.15*inch))
@@ -606,8 +727,7 @@ def create_pdf_report(results_dict):
         story.append(PageBreak())
         img_buffer = io.BytesIO()
         fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-        img_buffer.seek(0)
-        img = Image(img_buffer, width=6.5*inch, height=4.5*inch)
+        img = get_auto_scaled_image(img_buffer)
         story.append(Paragraph(f"ESI+ RT Alignment Window", heading_style))
         story.append(img)
         figure_count += 1
@@ -617,8 +737,7 @@ def create_pdf_report(results_dict):
         story.append(PageBreak())
         img_buffer = io.BytesIO()
         fig.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
-        img_buffer.seek(0)
-        img = Image(img_buffer, width=6.5*inch, height=4.5*inch)
+        img = get_auto_scaled_image(img_buffer)
         story.append(Paragraph(f"ESI− RT Alignment Window", heading_style))
         story.append(img)
         figure_count += 1
@@ -643,7 +762,12 @@ def create_pdf_report(results_dict):
     return pdf_buffer.getvalue()
 
 def create_results_zip(results_dict, rt_window_mode='composite_margin'):
-    """Creates a zip file containing all results tables and figures"""
+    """
+    Compiles all generated results—including match summaries, inclusion lists (Thermo Fisher format),
+    Skyline transition lists, and various graphical figures (SVG, HTML, PDF)—into a single ZIP archive.
+    This function provides a convenient way to download all output artifacts from the method optimization process.
+    Returns the ZIP file content as bytes.
+    """
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         # Match Summary
@@ -769,7 +893,6 @@ def create_results_zip(results_dict, rt_window_mode='composite_margin'):
             img_buffer.seek(0)
             zf.writestr(f'XIC_ESI-neg_Page{page_idx}.svg', img_buffer.getvalue())
 
-
         # --- PDF REPORT ---
         pdf_data = create_pdf_report(results_dict)
         if pdf_data:
@@ -780,10 +903,20 @@ def create_results_zip(results_dict, rt_window_mode='composite_margin'):
     return zip_buffer
 
 def clean_cas(cas_string):
+    """
+    Cleans and normalizes a CAS (Chemical Abstracts Service) number string.
+    It removes hyphens and spaces, returning a standardized CAS string for consistent matching.
+    If the input is NaN, an empty string is returned.
+    """
     if pd.isna(cas_string): return ""
     return str(cas_string).replace("-", "").replace(" ", "").strip()
 
 def get_core_name(name):
+    """
+    Extracts a simplified "core" name from a compound name string.
+    This helps in matching compounds that might have varied prefixes, suffixes, or annotations,
+    by focusing on the primary chemical identifier.
+    """
     name = str(name).lower()
     name = re.sub(r'^.*?:[a-z0-9_-]+\s+', '', name)
     name = re.sub(r'^[0-9]+_', '', name)
@@ -799,17 +932,10 @@ _ADDUCT_SUPERSCRIPT_MAP = str.maketrans({
 
 def format_adduct(raw_adduct, polarity):
     """
-    Normalizes any adduct string into the strict '[M+H]' style bracket format
-    (no charge symbol left inside or outside the brackets), e.g.:
-        'M+H'        -> '[M+H]'
-        '[M+H]+'     -> '[M+H]'
-        'M+H]+'      -> '[M+H]'
-        '[M+2H]2+'   -> '[M+2H]'
-        '[M+3H]3+'   -> '[M+3H]'
-        '[M-H]-'     -> '[M-H]'
-        'M+H+1'      -> '[M+H]'  (sign-then-digit charge notation)
-        '(M+H)+'     -> '[M+H]'  (parentheses instead of brackets)
-        '' / NaN     -> '[M+H]' or '[M-H]' (polarity default)
+    Normalizes an adduct string into a consistent bracketed format (e.g., '[M+H]').
+    This function standardizes adduct notation by removing extraneous charge symbols,
+    parentheses, and handling unicode superscripts. It ensures that adducts are
+    uniformly represented, falling back to a polarity-based default if the input is invalid.
     """
     default = 'M+H' if polarity == 'Positive' else 'M-H'
 
@@ -840,7 +966,10 @@ def format_adduct(raw_adduct, polarity):
 
 def calculate_scan_time(resolution, it_mode, custom_it, peak_width_sec, desired_pts, concurrent_targets):
     """
-    Calculates the true cycle time based on Thermo Exploris parallelized architecture.
+    Calculates the effective scan time for a Thermo Exploris mass spectrometer,
+    considering parallelized architecture, Orbitrap resolution, and injection time (IT) mode.
+    This function helps in predicting how many data points will be acquired across a chromatographic peak.
+    Returns the calculated scan time in milliseconds.
     """
     # Exact transient times for Exploris 480 resolutions (in ms)
     transients = {
@@ -882,11 +1011,12 @@ def calculate_scan_time(resolution, it_mode, custom_it, peak_width_sec, desired_
 
 def parse_mgf_spectrum_list(mgf_file_content):
     """
-    Parse MGF file content into list of spectrum dicts.
-    Handles PEPMASS, RTINSECONDS, CHARGE, MSLEVEL, and fragment peaks.
-    Only extracts MS/MS spectra directly from GNPS (Consensus MS/MS).
-    
-    Returns: list of dicts with keys: pepmass, rtinseconds, charge, mslevel, fragments
+    Parses MGF (Mascot Generic Format) file content to extract individual MS/MS spectra.
+    It specifically looks for PEPMASS, RTINSECONDS, CHARGE, and fragment ion data.
+    This function is tailored to process Consensus MS/MS MGFs directly from GNPS,
+    extracting relevant information for Skyline transition list generation.
+    Returns a list of dictionaries, where each dictionary represents a parsed spectrum
+    and contains keys like 'pepmass', 'rtinseconds', 'charge', 'mslevel', and 'fragments'.
     """
     spectra = []
     current_spectrum = None
@@ -972,15 +1102,6 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
         - unmatched_df: one row per target compound with zero transitions,
           with a best-effort reason (no m/z match, RT window mismatch,
           no usable fragments, or lost to a closer competing compound).
-
-    Format: Molecule List Name | Precursor Name | Precursor Formula | Precursor Adduct |
-            Precursor m/z | Product m/z | Precursor Charge | Product Charge | Explicit Retention Time
-
-    WORKFLOW:
-    1. Parse MGF file to extract PEPMASS (precursor m/z) and fragments
-    2. Match PEPMASS to compounds using ±compound_match_ppm_tolerance ppm m/z tolerance
-    3. Extract the 2 most abundant fragments (by intensity)
-    4. Create Skyline transition table with precursor and fragment m/z pairs
     """
     if not mgf_files or compound_df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -1036,7 +1157,7 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                 # Get precursor m/z from PEPMASS
                 precursor_mz = spectrum.get('pepmass')
                 rtinseconds = spectrum.get('rtinseconds')
-
+                
                 # Convert RT from seconds to minutes if available
                 rt_min = None
                 if rtinseconds:
@@ -1044,7 +1165,7 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                         rt_min = float(rtinseconds) / 60.0
                     except:
                         rt_min = None
-
+                
                 # Get fragment m/z and intensities
                 fragments = spectrum.get('fragments', [])
 
@@ -1067,11 +1188,11 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                     ppm_tol = compound_match_ppm_tolerance
                     matched_compound = None
                     mz_diff_best = float('inf')
-
+                    
                     for compound_name, compound_row in matched_compounds.items():
                         comp_mz = compound_row['m/z']
                         mz_diff_ppm = abs(precursor_mz - comp_mz) / comp_mz * 1e6
-
+                        
                         # Check m/z match and optionally RT window if RT is available
                         if mz_diff_ppm <= ppm_tol and mz_diff_ppm < mz_diff_best:
                             if rt_min is not None:
@@ -1084,7 +1205,7 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
                                 # If no RT available, use closest m/z match
                                 matched_compound = compound_name
                                 mz_diff_best = mz_diff_ppm
-
+                    
                     if matched_compound:
                         spectrum_record['assigned_compound'] = matched_compound
                         matched_spectra += 1
@@ -1252,10 +1373,10 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
     unique_compounds = result_df['Precursor Name'].nunique() if not result_df.empty else 0
     compounds_with_output = set(result_df['Precursor Name'].unique()) if not result_df.empty else set()
     spectrum_dedup_count = len(skyline_data) - len(final_deduplicated)
-
+    
     st.write(f"   • Transitions (after dedup): {len(final_deduplicated)}")
     st.write(f"   • Spectrum-level duplicates removed: {spectrum_dedup_count}")
-
+    
     # Show badge with matched precursors from compound list
     precursors_in_list = len(compound_df)
     precursors_matched = len(matched_precursor_set)
@@ -1264,7 +1385,7 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
         st.metric("Unique Compounds in Output", unique_compounds)
     with col2:
         st.metric("Precursors from List Matched", f"{precursors_matched}/{precursors_in_list}")
-
+    
     if total_spectra == 0:
         st.warning("⚠️ **No spectra found in MGF files!** Check that MGF files are not empty and are in proper format.")
     elif matched_spectra == 0:
@@ -1343,7 +1464,10 @@ def extract_skyline_transitions_from_mgf(mgf_files, compound_df, polarity_mode, 
 
 def create_compound_match_summary(all_targets_df, matched_compounds_set, polarity_mode, col_targets_compound=TARGETS_COMPOUND_COL):
     """
-    Creates a summary table of all target compounds with matched/unmatched status.
+    Generates a summary table of all target compounds, indicating their match status
+    (matched or not matched) against the processed data for a specific polarity mode.
+    This provides a clear overview of the success rate of compound identification.
+    Returns a DataFrame containing the compound names, match status, polarity, and other relevant details.
     """
     summary_data = []
     
@@ -1352,9 +1476,6 @@ def create_compound_match_summary(all_targets_df, matched_compounds_set, polarit
         
         if compound_name in matched_compounds_set:
             status = "✓ Matched"
-            # Find the matched row to get m/z and other details
-            matched_row = next((r for r in matched_compounds_set 
-                              if r[0] == compound_name), None)
         else:
             status = "✗ Not Matched"
         
@@ -1372,20 +1493,12 @@ def create_compound_match_summary(all_targets_df, matched_compounds_set, polarit
 def calculate_rt_window(peak_rt, composite_rt_min, composite_rt_max, rt_window_mode,
                          rt_margin_min=1.0, rt_margin_pct=None, expected_peak_width_min=0.167, fwhm=0.0):
     """
-    Calculate retention time window based on selected mode.
-    
-    Modes:
-    - 'symmetric_margin': Option 1a — (peak_rt - margin_min, peak_rt + margin_min)
-    - 'symmetric_margin_pct': Option 1b — (peak_rt - peak_rt*margin_pct%, peak_rt + peak_rt*margin_pct%)
-    - 'composite_margin': Option 2a — (rt_start - margin_min, rt_stop + margin_min)
-    - 'composite_margin_pct': Option 2b — (rt_start - rt_start*margin_pct%, rt_stop + rt_stop*margin_pct%)
-    - 'fwhm_margin': Option 3a — ((peak_rt - FWHM) - margin_min, (peak_rt + FWHM) + margin_min)
-    - 'fwhm_margin_pct': Option 3b — Base ± (Base*margin_pct%) where Base is RT ± FWHM
-    - 'hybrid': Option 4 — Use 1a if peak_width <= expected_peak_width_min, else use 2b
-    - 'rt_window': Return tuple (rt, window_size) for Retention Time Window mode
-    - 'unscheduled': Return (None, None) for Unscheduled mode
-    
-    Returns: (t_start, t_stop, exp_peak_width_min)
+    Calculates the retention time (RT) window based on the selected mode and user-defined margins.
+    This function offers various strategies for defining RT windows around chromatographic peaks,
+    including symmetric, composite, FWHM-based, and hybrid approaches. It ensures that the
+    generated RT windows are appropriate for targeted PRM acquisition methods.
+    Returns a tuple of (t_start, t_stop, exp_peak_width_min) representing the calculated
+    start and stop times for the RT window, and the expected peak width.
     """
     exp_peak_width_min = max(2.0, composite_rt_max - composite_rt_min)
     
@@ -1472,6 +1585,14 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
                      col_mzmine_height=MZMINE_HEIGHT_COL, col_mzmine_charge=MZMINE_CHARGE_COL,
                      col_targets_compound=TARGETS_COMPOUND_COL, col_targets_cas=TARGETS_CAS_COL,
                      col_targets_smiles=TARGETS_SMILES_COL, col_targets_formula=TARGETS_FORMULA_COL):
+    """
+    Processes data for a specific ionization polarity (positive or negative).
+    This function integrates GNPS and MZmine data with target compounds,
+    validates column mappings, calculates retention time windows, and formats
+    the results for PRM method generation.
+    Returns a DataFrame containing processed target compounds with their
+    chromatographic and spectral information, ready for further optimization.
+    """
     gnps_df = gnps_df.copy()
     
     # Validate and map GNPS columns (case-insensitive)
@@ -1572,6 +1693,8 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
     merged = pd.merge(matched_gnps, mzmine_df, left_on=col_gnps_scan, right_on=col_mzmine_scan, how='inner')
     if col_mzmine_height in merged.columns:
         merged[col_mzmine_height] = pd.to_numeric(merged[col_mzmine_height], errors='coerce').fillna(0)
+    else:
+        merged[col_mzmine_height] = 0
 
     results = []
     for compound_name, group in merged.groupby('Standardized_Compound'):
@@ -1639,6 +1762,12 @@ def process_polarity(gnps_df, mzmine_df, polarity, targets_df, hcd_energies,
     return pd.DataFrame(results)
 
 def compute_concurrency_and_metrics(df, title_base, resolution, it_mode, custom_it, desired_pts, peak_width_source="Use configured peak width", configured_peak_width_min=0.167):
+    """
+    Calculates and visualizes the concurrency (number of simultaneous targets) across the retention time gradient.
+    It also computes key metrics such as maximum concurrent targets, maximum cycle time,
+    and estimated points per peak, which are critical for method optimization.
+    Returns the DataFrame with added metrics and a list of Matplotlib figure objects for concurrency plots.
+    """
     if df.empty: return df, []
     
     out_dfs = []
@@ -1685,6 +1814,13 @@ def compute_concurrency_and_metrics(df, title_base, resolution, it_mode, custom_
     return pd.concat(out_dfs).sort_values('Peak_RT'), figures
 
 def build_points_per_peak_figure(df, title):
+    """
+    Generates bar charts visualizing the estimated points per peak for each compound.
+    This figure helps in assessing the quality of data acquisition and identifying compounds
+    that may require method adjustments to ensure sufficient data points are collected.
+    Points per peak are color-coded for easy interpretation (excellent, good, poor).
+    Returns a list of Matplotlib figure objects, one for each multiplex group.
+    """
     if df.empty: return []
     figures = []
     
@@ -1700,7 +1836,7 @@ def build_points_per_peak_figure(df, title):
             elif pts >= 2: return '#d62728'    # red
             else: return '#8b0000'             # dark red
         
-        colors = [get_color(pts) for pts in group_df['Est_Points_Per_Peak']]
+        colors = [get_color(pts) for pts in group_df['Est_Points_Per_Peak']] 
         bars = ax.barh(group_df['Compound'], group_df['Est_Points_Per_Peak'], color=colors, edgecolor='black', linewidth=0.8)
         
         for i, (bar, val) in enumerate(zip(bars, group_df['Est_Points_Per_Peak'])):
@@ -1722,6 +1858,12 @@ def build_points_per_peak_figure(df, title):
     return figures
 
 def build_rt_alignment_figure(df, title, rt_window_mode="Composite range ± margin"):
+    """
+    Generates a figure visualizing the retention time (RT) windows and peak apexes for compounds.
+    This helps in assessing the temporal alignment of targets and the effectiveness of the defined
+    RT windows for chromatographic separation. Each multiplex group is plotted separately.
+    Returns a list of Matplotlib figure objects, one for each multiplex group.
+    """
     if df.empty: return []
     figures = []
     
@@ -1759,7 +1901,7 @@ def build_rt_alignment_figure(df, title, rt_window_mode="Composite range ± marg
     
     return figures
 
-def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance, targets_per_page=50):
+def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance, targets_per_page=40):
     """
     Extracts TIC and XICs from mzML file for visualization.
     Returns a list of matplotlib Figures, one per page of up to `targets_per_page`
@@ -1852,7 +1994,7 @@ def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance, targe
 
         for page_idx, page_targets in enumerate(pages, start=1):
             n = len(page_targets)
-            fig, axes = plt.subplots(2 + n, 1, figsize=(14, 6 + 1.2 * n), dpi=72, sharex=True)
+            fig, axes = plt.subplots(2 + n, 1, figsize=(14, 6 + 1.5 * n), dpi=72, sharex=True)
 
             page_title = f"TIC & XICs ({title_base})" + (f" — Page {page_idx}/{num_pages}" if num_pages > 1 else "")
 
@@ -1886,10 +2028,15 @@ def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance, targe
                 peak_rt = t['Peak_RT']
                 ax.axvline(peak_rt, color='red', linestyle='--', linewidth=1.5, alpha=0.7, zorder=2)
 
-                # Add RT label on the peak line
+                # Add headroom above the tallest point so the RT label can sit
+                # clearly above the peak apex instead of overlapping it.
                 max_intensity = max(xic_values) if xic_values else 1
-                ax.text(peak_rt, max_intensity * 0.95, f'RT: {peak_rt:.2f}', rotation=0, fontsize=9,
-                       ha='center', va='top', color='red', fontweight='bold',
+                ax.set_ylim(0, max_intensity * 1.55)
+
+                # RT label placed well above the peak (bottom-anchored, in the
+                # headroom) so there's a clear visual gap from the apex.
+                ax.text(peak_rt, max_intensity * 1.25, f'RT: {peak_rt:.2f}', rotation=0, fontsize=9,
+                       ha='center', va='bottom', color='red', fontweight='bold',
                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.6, edgecolor='red'))
 
                 # Compound label - positioned to avoid peak if possible
@@ -1902,7 +2049,6 @@ def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance, targe
 
                 ax.set_ylabel("Intensity", fontsize=10)
                 ax.grid(True, linestyle='--', alpha=0.5)
-                ax.set_ylim(bottom=0)
 
             axes[-1].set_xlabel("Retention Time (min)", fontsize=12, fontweight='bold')
             axes[-1].set_xlim(0, 16)
@@ -1922,12 +2068,15 @@ def build_mzml_figure(mzml_file, target_df, title_base, xic_ppm_tolerance, targe
         return None
 
 def build_mz_rt_figure(target_df, title_base, polarity):
-    """Creates an interactive 2D scatter plot: m/z vs Retention Time using Plotly"""
+    """
+    Creates an interactive 2D scatter plot of m/z versus Retention Time using Plotly.
+    This visualization allows for interactive exploration of the detected compounds,
+    showing their m/z, RT, and peak intensity. It's particularly useful for
+    identifying trends and potential issues in chromatographic data.
+    Returns a Plotly Figure object, or None if the input DataFrame is empty.
+    """
     if target_df.empty:
         return None
-    
-    # Normalize height for color scaling
-    height_normalized = (target_df['Height'] - target_df['Height'].min()) / (target_df['Height'].max() - target_df['Height'].min() + 1e-10) if target_df['Height'].max() > target_df['Height'].min() else [0.5] * len(target_df)
     
     fig = go.Figure()
     
@@ -1977,8 +2126,37 @@ def build_mz_rt_figure(target_df, title_base, polarity):
     return fig
 
 # =============================================================================
-# STREAMLIT UI & SIDEBAR
+# Session State Reset Helpers
 # =============================================================================
+#
+# These functions are used to clear specific parts of the Streamlit session state,
+# ensuring that the application can be reset to a clean slate or that previous
+# results are cleared when new data is loaded or settings are changed.
+def reset_results():
+    """
+    Clears the processed results DataFrame from the Streamlit session state.
+    This function is typically called when new input data is provided or when
+    the user explicitly requests a reset of the results section.
+    """
+    st.session_state.pop('results', None)
+
+def reset_all_outputs():
+    """
+    Resets both the processed results and any fetched GNPS task data from the session state.
+    This provides a comprehensive reset, useful when switching between major input modes
+    or starting a new analysis from scratch.
+    """
+    st.session_state.pop('results', None)
+    st.session_state.pop('gnps_data_fetched', None)
+
+# =============================================================================
+# Streamlit User Interface and Sidebar Configuration
+# =============================================================================
+#
+# This section defines the layout, input widgets, and interactive components of
+# the Streamlit application. It includes settings for instrument configuration,
+# data processing parameters, column mappings, and the main data input methods
+# (manual upload, GNPS2 Task ID, or test data).
 try:
     st.set_page_config(page_title="GNPS2-Quant | PRM Method Generator", page_icon="🔬", layout="wide")
 except Exception:
@@ -2156,19 +2334,19 @@ with st.sidebar:
             st.session_state.col_targets_formula = st.text_input("Target Formula", value=st.session_state.col_targets_formula, key="input_targets_formula", help="Optional: Column for formula")
 
 st.title("🔬 GNPS2-Quant Method Optimizer")
-st.markdown("Optimize Points-Per-Peak prior to exporting your Thermo Exploris 480 Inclusion Lists.")
-st.markdown("**Workflow:** Match your DDA datasets (GNPS2 + MZmine results) against a target compound list.")
-# Information section about the page
 with st.expander("ℹ️ About GNPS2-Quant Method Optimizer", expanded=True):
     st.markdown("""
-    **GNPS2-Quant** is a workflow optimization platform designed to generate high-quality **Parallel Reaction Monitoring (PRM) Inclusion Lists** for target compounds. 
+    **GNPS2-Quant** is your go-to platform for generating high-quality **Parallel Reaction Monitoring (PRM) Inclusion Lists**.
+    It helps you optimize 'Points-Per-Peak' before exporting your Thermo Exploris 480 Inclusion Lists.
     
-    By matching compound reference lists against Data-Dependent Acquisition (DDA) experiment results (from **GNPS2 spectral libraries** and **MZmine 3 feature tables**), the tool:
-    - **Finds the best chromatographic peaks** case-insensitively across multiple datasets.
-    - **Models instrument constraints** (transient times and maximum injection times) on the **Thermo Exploris 480** mass spectrometer.
-    - **Predicts cycle times & Points-Per-Peak** to ensure you acquire enough data points across each chromatographic peak.
-    - **Generates Skyline Transition Lists** by extracting consensus fragment ions directly from library `.mgf` spectra.
-    - **Optimizes method concurrency** by splitting targets into multiplexed inclusion lists.
+    **The Core Workflow:** Match your Data-Dependent Acquisition (DDA) experiment results (from **GNPS2 spectral libraries** and **MZmine 3 feature tables**) against your target compound list.
+    
+    **What this tool does for you:**
+    - **Identifies optimal chromatographic peaks** by performing a case-insensitive match across multiple datasets.
+    - **Simulates instrument behavior** using Thermo Exploris 480 mass spectrometer constraints (transient times and maximum injection times).
+    - **Forecasts cycle times & Points-Per-Peak** to guarantee sufficient data acquisition across each chromatographic peak.
+    - **Creates Skyline Transition Lists** by extracting consensus fragment ions directly from `.mgf` spectra.
+    - **Enhances method efficiency** by optionally splitting targets into multiplexed inclusion lists.
     """)
 
 # Initialize data variables to avoid NameErrors in Status table when switching modes
@@ -2186,7 +2364,7 @@ if "generate_skyline" not in st.session_state:
 if 'gnps_data_fetched' not in st.session_state:
     st.session_state['gnps_data_fetched'] = None
 
-st.radio("Input Method", options=["Manual Input", "GNPS2 Task ID", "Test Data"], index=0, key="input_mode", help="Choose how to provide your data for processing")
+st.radio("Input Method", options=["Manual Input", "GNPS2 Task ID", "Everything Bagel Task ID", "Test Data"], index=0, key="input_mode", help="Choose how to provide your data for processing", horizontal = True)
 
 generate_skyline = st.session_state.generate_skyline
     
@@ -2268,12 +2446,10 @@ if st.session_state.input_mode == "Manual Input":
         generate_skyline = st.checkbox(
             "Generate Skyline Mass List? (Extracts fragments from MGF)", 
             value=st.session_state.generate_skyline,
-            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires MGF files to be uploaded below.",
+            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires MGF files to be uploaded below. Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.",
             key="skyline_manual"
         )
-        if generate_skyline:
-            st.info("Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.")
-            
+        
         if generate_skyline != st.session_state.generate_skyline:
             st.session_state.generate_skyline = generate_skyline
             st.rerun()
@@ -2287,13 +2463,22 @@ if st.session_state.input_mode == "Manual Input":
             st.info("💡 **Tip:** Enable 'Generate Skyline Mass List' above if you want to include fragment ions in your results.")
 
 elif st.session_state.input_mode == "GNPS2 Task ID":
-    step1, step2 = st.tabs(["Step 1: Upload Target Compound List", "Step 2: Enter GNPS2 Task ID"])
+    step1, step2 = st.tabs(["Step 1: Upload Target Compound List & Optional LC-MS Data", "Step 2: Enter GNPS2 Task ID"])
     with step1: 
-        st.subheader("📋 Step 1: Upload Target Compound List")
-        st.markdown("""
-            This is your **internal reference library** — the compounds you want to target in your PRM method.
-            """)
-        f_compounds = st.file_uploader("Compounds.csv (Required)", type=["csv"], key="compounds_upload")
+        st.subheader("📋 Step 1: Upload Target Compound List & Optional LC-MS Data")
+        st.markdown("""This is your **internal reference library** — the compounds you want to target in your PRM method. You can also optionally upload your LC-MS raw data in mzML format for XIC extraction.""")
+        c1, c2, c3 = st.columns(3)
+        with c1: 
+            f_compounds = st.file_uploader("Compounds.csv (Required)", type=["csv"], key="compounds_upload")
+        with c2: 
+            f_mzml_pos = None
+            f_mzml_neg = None
+            if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                f_mzml_pos = st.file_uploader("LC-MS Raw Data (.mzML) — ESI+", type=["mzML", "mzml"], key="mzml_pos", help="Leave empty to skip XIC extraction (speeds up processing)")
+        with c3:    
+            if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                f_mzml_neg = st.file_uploader("LC-MS Raw Data (.mzML) — ESI−", type=["mzML", "mzml"], key="mzml_neg", help="Leave empty to skip XIC extraction (speeds up processing)")
+
     with step2: 
         st.subheader("📁 Step 2: Enter GNPS2 Task ID")
         task_id = st.text_input("GNPS2 Task ID", placeholder="Enter GNPS2 Task ID (e.g., 1234567890abcdef)", key="gnps_task_id")
@@ -2301,19 +2486,17 @@ elif st.session_state.input_mode == "GNPS2 Task ID":
         generate_skyline = st.checkbox(
             "Generate Skyline Mass List? (Extracts fragments from MGF)", 
             value=st.session_state.generate_skyline,
-            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires fetching the Consensus MS/MS MGF from GNPS.",
+            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires fetching the Consensus MS/MS MGF from GNPS. Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.",
             key="skyline_taskid"
         )
-        if generate_skyline:
-            st.info("ℹ️ Skyline transitions require: (1) MGF files fetched from GNPS, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is found, or nothing matches, no Skyline file will be generated.")
-            
+        
         if generate_skyline != st.session_state.generate_skyline:
             st.session_state.generate_skyline = generate_skyline
             st.rerun()
 
         # Use global generate_skyline setting for MGF fetching
         fetch_mgf_choice = generate_skyline
-
+            
         # Fetch button
         if st.button("🌐 Fetch GNPS Task ID", disabled=not (len(task_id) > 5)):
             with st.status("Fetching GNPS Task Data...", expanded=True):
@@ -2330,11 +2513,175 @@ elif st.session_state.input_mode == "GNPS2 Task ID":
                     st.success(f"✓ Successfully fetched data for Task ID: {task_id}")
                 except Exception as e:
                     st.error(f"Error fetching data: {str(e)}")
+elif st.session_state.input_mode == "Everything Bagel Task ID":
+    step1, step2 = st.tabs(["Step 1: Upload Target Compound List & Optional LC-MS Data", "Step 2: Enter Everything Bagel Task ID"])
+    with step1: 
+        st.subheader("📋 Step 1: Upload Target Compound List & Optional LC-MS Data")
+        st.markdown("""This is your **internal reference library** — the compounds you want to target in your PRM method. You can also optionally upload your LC-MS raw data in mzML format for XIC extraction.""")
+        c1, c2, c3 = st.columns(3)
+        with c1: 
+            f_compounds = st.file_uploader("Compounds.csv (Required)", type=["csv"], key="compounds_upload")
+        with c2: 
+            f_mzml_pos = None
+            f_mzml_neg = None
+            if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                f_mzml_pos = st.file_uploader("LC-MS Raw Data (.mzML) — ESI+", type=["mzML", "mzml"], key="mzml_pos", help="Leave empty to skip XIC extraction (speeds up processing)")
+        with c3:    
+            if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                f_mzml_neg = st.file_uploader("LC-MS Raw Data (.mzML) — ESI−", type=["mzML", "mzml"], key="mzml_neg", help="Leave empty to skip XIC extraction (speeds up processing)")
 
-else:
-    st.write("**Test Data:** Use example datasets to test the workflow and visualize results.") 
+    with step2: 
+        st.subheader("📁 Step 2: Enter Everything Bagel Task ID")
+        task_id = st.text_input("Everything Bagel Task ID", placeholder="Enter Everything Bagel Task ID (e.g., 1234567890abcdef)", key="bagel_task_id")
+        generate_skyline = st.checkbox(
+            "Generate Skyline Mass List? (Extracts fragments from MGF)",
+            value=st.session_state.generate_skyline,
+            help="Extracts fragment ions from MGF spectra for direct Skyline import. Requires fetching the Consensus MS/MS MGF from Everything Bagel. Skyline transitions require: (1) MGF files uploaded below for the relevant polarity, and (2) at least one MS/MS spectrum whose PEPMASS falls within ±10 ppm of a matched inclusion-list target's m/z. If nothing is uploaded, or nothing matches, no Skyline file will be generated.",
+            key="skyline_bagel"
+        )
+        
+        if generate_skyline != st.session_state.generate_skyline:
+            st.session_state.generate_skyline = generate_skyline
+            st.rerun()
 
-# Validation
+        # Use global generate_skyline setting for MGF fetching
+        fetch_mgf_choice = generate_skyline
+
+        # Fetch button
+        if st.button("🌐 Fetch Everything Bagel Task ID", disabled=not (len(task_id) > 5)):
+            with st.status("Fetching Everything Bagel Task Data...", expanded=True):
+                try:
+                    gnps_df, mzmine_df, mgf_content, is_gnps2 = load_eb_task_data(task_id, fetch_mgf=fetch_mgf_choice)
+                    st.session_state['gnps_data_fetched'] = {
+                        'gnps_df': gnps_df,
+                        'mzmine_df': mzmine_df,
+                        'mgf_content': mgf_content,
+                        'is_gnps2': is_gnps2,
+                        'task_id': task_id,
+                        'mgf_fetched': fetch_mgf_choice
+                    }
+                    st.success(f"✓ Successfully fetched data for Task ID: {task_id}")
+                except Exception as e:
+                    st.error(f"Error fetching data: {str(e)}")
+
+else: # Test Data Mode
+    # st.divider()
+    st.radio(label="Select Input Mode", options=["Option 1: Manual Input Test Data", "Option 2: GNPS2 Task ID Test Data", "Option 3: Everything Bagel Task ID Test Data"], index=0, key="test_data_mode", on_change=reset_all_outputs)
+
+    # Define paths
+    base_path = "Manual_Test_Data/"
+    path_compounds = base_path + "Compounds_Completed.csv"
+    path_gnps = base_path + "Mix_179Xeno_pos_gnps.csv"
+    path_mzmine = base_path + "Mix_179Xeno_pos_quant_full.csv"
+    path_mzml = base_path + "Mix_179Xeno_5ugml_pos_01.mzML"
+
+    if st.session_state.test_data_mode == "Option 1: Manual Input Test Data":
+        try:
+            f_compounds = open(path_compounds, "rb")
+            f_gnps_pos = [open(path_gnps, "rb")]
+            f_mzmine_pos = [open(path_mzmine, "rb")]
+            f_mzml_pos = open(path_mzml, "rb")
+            
+            c1, c2 = st.columns(2); c3, c4 = st.columns(2)
+            with c1: st.success("✓ Loaded test compounds")
+            with c2: st.success("✓ Loaded test GNPS+")
+            with c3: st.success("✓ Loaded test MZmine+")
+            with c4: st.success("✓ Loaded test mzML")
+            
+            f_gnps_neg, f_mzmine_neg, f_mzml_neg = None, None, None
+
+        except FileNotFoundError as e:
+            st.error(f"Test files missing: {e}")
+
+    elif st.session_state.test_data_mode == "Option 2: GNPS2 Task ID Test Data": # Option 2: GNPS2 Task ID Test Data
+        f_compounds = None
+        f_gnps_pos, f_mzmine_pos, f_mzml_pos = None, None, None
+        f_gnps_neg, f_mzmine_neg, f_mzml_neg = None, None, None
+        try:
+            f_compounds = open(path_compounds, "rb")
+            f_mzml_pos = open(path_mzml, "rb")
+            
+            c1, c2 = st.columns(2)
+            test_task_id = "20a59d94003c41168a5186a00e2ac086"
+            st.info(f"Targeting Task ID: `{test_task_id}`")
+
+            with c1: st.success("✓ Loaded test compounds")
+            with c2: st.success("✓ Loaded test mzML")
+            
+            generate_skyline = st.checkbox("Generate Skyline Mass List? (Extracts fragments from MGF)", 
+                value = True, 
+                help ="Extracts fragment ions from MGF spectra for direct Skyline import. Requires fetching the Consensus MS/MS MGF from GNPS.",
+                key ="skyline_taskid", 
+                disabled = True
+            )
+
+            if generate_skyline != st.session_state.generate_skyline:
+                st.session_state.generate_skyline = generate_skyline
+                st.rerun()
+
+            # Use global generate_skyline setting for MGF fetching
+            fetch_mgf_choice = generate_skyline
+            
+            if st.button("🌐 Fetch Test Task Data"):
+                with st.status("Fetching GNPS Task Data...", expanded=True):
+                    try:
+                        gnps_df, mzmine_df, mgf_content, is_gnps2 = load_gnps_task_data(test_task_id, fetch_mgf=True)
+                        st.session_state['gnps_data_fetched'] = {
+                            'gnps_df': gnps_df, 'mzmine_df': mzmine_df,
+                            'mgf_content': mgf_content, 'is_gnps2': is_gnps2,
+                            'task_id': test_task_id, 'mgf_fetched': True
+                        }
+                        st.success(f"✓ Data for {test_task_id} cached.")
+                    except Exception as e:
+                        st.error(f"Fetch failed: {str(e)}")
+        except FileNotFoundError as e:
+            st.error(f"Test files missing: {e}")
+            
+    else: # Option 3: Everything Bagel Task ID Test Data
+        f_compounds = None
+        f_gnps_pos, f_mzmine_pos, f_mzml_pos = None, None, None
+        f_gnps_neg, f_mzmine_neg, f_mzml_neg = None, None, None
+        try:
+            f_compounds = open(path_compounds, "rb")
+            f_mzml_pos = open(path_mzml, "rb")
+            
+            c1, c2 = st.columns(2)
+            test_task_id = "bb0e73ec72fd441db8c77f1d92c57e3d"
+            st.info(f"Targeting Task ID: `{test_task_id}`")
+
+            with c1: st.success("✓ Loaded test compounds")
+            with c2: st.success("✓ Loaded test mzML")
+            
+            generate_skyline = st.checkbox("Generate Skyline Mass List? (Extracts fragments from MGF)", 
+                value = True, 
+                help ="Extracts fragment ions from MGF spectra for direct Skyline import. Requires fetching the Consensus MS/MS MGF from GNPS.",
+                key ="skyline_taskid_eb", 
+                disabled = True
+            )
+
+            if generate_skyline != st.session_state.generate_skyline:
+                st.session_state.generate_skyline = generate_skyline
+                st.rerun()
+
+            # Use global generate_skyline setting for MGF fetching
+            fetch_mgf_choice = generate_skyline
+            
+            if st.button("🌐 Fetch Test Task Data"):
+                with st.status("Fetching GNPS Task Data...", expanded=True):
+                    try:
+                        gnps_df, mzmine_df, mgf_content, is_gnps2 = load_eb_task_data(test_task_id, fetch_mgf=True)
+                        st.session_state['gnps_data_fetched'] = {
+                            'gnps_df': gnps_df, 'mzmine_df': mzmine_df,
+                            'mgf_content': mgf_content, 'is_gnps2': is_gnps2,
+                            'task_id': test_task_id, 'mgf_fetched': True
+                        }
+                        st.success(f"✓ Data for {test_task_id} cached.")
+                    except Exception as e:
+                        st.error(f"Fetch failed: {str(e)}")
+        except FileNotFoundError as e:
+            st.error(f"Test files missing: {e}")
+
+# --- Data Validation Checks ---
 if f_compounds is None:
     st.warning("⚠️ Upload a Compounds.csv file to proceed")
     st.stop()
@@ -2373,71 +2720,110 @@ elif st.session_state.input_mode == "GNPS2 Task ID":
             pass # warning already shown
         elif f_compounds is None:
             st.info("📥 Upload a Compounds.csv file to proceed.")
+elif st.session_state.input_mode == "Everything Bagel Task ID":
+    # Check if data has been fetched for the current task_id
+    fetched = st.session_state.get('gnps_data_fetched')
+    task_id = st.session_state.get('bagel_task_id', '')
+
+    data_ready = fetched is not None and fetched.get('task_id') == task_id
+
+    # Check if MGF is needed but not fetched
+    mgf_needed_but_missing = generate_skyline and data_ready and not fetched.get('mgf_fetched')
+
+    if mgf_needed_but_missing:
+        st.warning("⚠️ Skyline output is enabled in the sidebar, but your currently fetched Everything Bagel data does not include the MGF file. Click '🌐 Fetch Everything Bagel Task ID' again to retrieve it.")
+        all_ready = False
+    else:
+        all_ready = data_ready and (f_compounds is not None)
+
+    if not all_ready:
+        if not data_ready:
+            st.info("📥 Enter an Everything Bagel Task ID and click '🌐 Fetch Everything Bagel Task ID' to proceed.")
+        elif mgf_needed_but_missing:
+            pass # warning already shown
+        elif f_compounds is None:
+            st.info("📥 Upload a Compounds.csv file to proceed.")
 else:
     # Test Data mode
     all_ready = (f_compounds is not None)
 
-# Display upload status in a color-coded table
+# --- Display Upload Status in a Color-Coded Table ---
 st.divider()
 st.subheader("📋 Upload Status")
 
-# Determine GNPS status message for Task ID mode
+# Determine GNPS status message
 gnps_status = "✗ Not fetched"
-if st.session_state.get('input_mode') == "GNPS2 Task ID":
-    fetched = st.session_state.get('gnps_data_fetched')
-    if fetched and fetched.get('task_id') == st.session_state.get('gnps_task_id'):
-        gnps_status = "✓ Data Fetched"
-        if fetched.get('mgf_fetched'):
-            if fetched.get('mgf_content'):
-                gnps_status += " (MGF included)"
-            else:
-                gnps_status += " (MGF not found)"
-        else:
-            gnps_status += " (MGF skipped)"
+current_mode = st.session_state.get('input_mode')
+fetched = st.session_state.get('gnps_data_fetched')
+
+effective_mode = current_mode
+if current_mode == "Test Data":
+    test_mode = st.session_state.get('test_data_mode')
+    if test_mode == "Option 1: Manual Input Test Data":
+        effective_mode = "Manual Input"
+    elif test_mode == "Option 2: GNPS2 Task ID Test Data":
+        effective_mode = "GNPS2 Task ID"
+    elif test_mode == "Option 3: Everything Bagel Task ID Test Data":
+        effective_mode = "Everything Bagel Task ID"
+
+if effective_mode == "GNPS2 Task ID":
+    target_id = "20a59d94003c41168a5186a00e2ac086" if current_mode == "Test Data" else st.session_state.get('gnps_task_id')
+    if fetched and fetched.get('task_id') == target_id:
+        gnps_status = "✓ Data Fetched" if current_mode != "Test Data" else "✓ Test Data Fetched"
+elif effective_mode == "Everything Bagel Task ID":
+    target_id = "bb0e73ec72fd441db8c77f1d92c57e3d" if current_mode == "Test Data" else st.session_state.get('bagel_task_id')
+    if fetched and fetched.get('task_id') == target_id:
+        gnps_status = "✓ Data Fetched" if current_mode != "Test Data" else "✓ Test Data Fetched"
+else:
+    target_id = None
+
+# Add MGF info to the status string if it was fetched
+if "Fetched" in gnps_status and fetched:
+    if fetched.get('mgf_content'):
+        gnps_status += " (MGF included)" if fetched.get('mgf_content') else " (MGF not found)"
+    else:
+        gnps_status += " (MGF skipped)"
+        
+if effective_mode == "Everything Bagel Task ID" and "Fetched" in gnps_status:
+    mzmine_label = "Everything Bagel Quantification"
+elif effective_mode == "GNPS2 Task ID" and "Fetched" in gnps_status:
+    mzmine_label = "GNPS2 Quantification"
+else:
+    mzmine_label = "MZmine 3"
 
 status_data = {
     "Data / Channel": [
         "Reference Library (Compounds.csv)",
         "ESI+ (Positive Mode) GNPS2",
-        "ESI+ (Positive Mode) MZmine 3",
+        f"ESI+ (Positive Mode) {mzmine_label}",
         "ESI+ (Positive Mode) Raw mzML",
         "ESI− (Negative Mode) GNPS2",
-        "ESI− (Negative Mode) MZmine 3",
+        f"ESI− (Negative Mode) {mzmine_label}",
         "ESI− (Negative Mode) Raw mzML"
     ],
+    
     "Status": [
         "✓ Loaded" if f_compounds is not None else "✗ Missing",
-        f"✓ {len(f_gnps_pos)} files" if f_gnps_pos else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
-        f"✓ {len(f_mzmine_pos)} files" if f_mzmine_pos else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
+        f"✓ {len(f_gnps_pos)} files" if (isinstance(f_gnps_pos, list) and len(f_gnps_pos) > 0) else (gnps_status if current_mode in ["GNPS2 Task ID", "Everything Bagel Task ID", "Test Data"] and effective_mode != "Manual Input" else "✗ Not uploaded"),
+        f"✓ {len(f_mzmine_pos)} files" if (isinstance(f_mzmine_pos, list) and len(f_mzmine_pos) > 0) else (gnps_status if current_mode in ["GNPS2 Task ID", "Everything Bagel Task ID", "Test Data"] and effective_mode != "Manual Input" else "✗ Not uploaded"),
         "✓ Uploaded" if f_mzml_pos else "✗ Not uploaded",
-        f"✓ {len(f_gnps_neg)} files" if f_gnps_neg else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
-        f"✓ {len(f_mzmine_neg)} files" if f_mzmine_neg else (gnps_status if st.session_state.get('input_mode') == "GNPS2 Task ID" else "✗ Not uploaded"),
+        f"✓ {len(f_gnps_neg)} files" if (isinstance(f_gnps_neg, list) and len(f_gnps_neg) > 0) else (gnps_status if current_mode in ["GNPS2 Task ID", "Everything Bagel Task ID", "Test Data"] and effective_mode != "Manual Input" else "✗ Not uploaded"),
+        f"✓ {len(f_mzmine_neg)} files" if (isinstance(f_mzmine_neg, list) and len(f_mzmine_neg) > 0) else (gnps_status if current_mode in ["GNPS2 Task ID", "Everything Bagel Task ID", "Test Data"] and effective_mode != "Manual Input" else "✗ Not uploaded"),
         "✓ Uploaded" if f_mzml_neg else "✗ Not uploaded"
     ]
 }
 
-# Add Skyline status if enabled
-if generate_skyline:
-    input_mode = st.session_state.get('input_mode')
-    if input_mode == "Manual Input":
-        status_data["Data / Channel"].extend(["ESI+ (Positive Mode) GNPS MGF", "ESI− (Negative Mode) GNPS MGF"])
-        status_data["Status"].extend([
-            f"✓ {len(mgf_pos_files)} files" if mgf_pos_files else "✗ Not uploaded",
-            f"✓ {len(mgf_neg_files)} files" if mgf_neg_files else "✗ Not uploaded"
-        ])
-    elif input_mode == "GNPS2 Task ID":
-        fetched = st.session_state.get('gnps_data_fetched')
-        mgf_state = "✗ Not fetched"
-        if fetched and fetched.get('task_id') == st.session_state.get('gnps_task_id'):
-            if fetched.get('mgf_content'):
-                mgf_state = "✓ MGF Fetched"
-            elif fetched.get('mgf_fetched'):
-                mgf_state = "✗ MGF Not Found"
-            else:
-                mgf_state = "✗ MGF Skipped"
-        
-        status_data["Data / Channel"].append("Consensus MS/MS MGF (Skyline)")
-        status_data["Status"].append(mgf_state)
+mgf_state = "✗ Not fetched"
+if target_id and fetched and fetched.get('task_id') == target_id:
+    if fetched.get('mgf_content'):
+        mgf_state = "✓ MGF Fetched"
+    elif fetched.get('mgf_fetched'):
+        mgf_state = "✗ MGF Not Found"
+    else:
+        mgf_state = "✗ MGF Skipped"
+
+status_data["Data / Channel"].append("Consensus MS/MS MGF (Skyline)")
+status_data["Status"].append(mgf_state)
 
 status_df = pd.DataFrame(status_data)
 
@@ -2458,10 +2844,11 @@ def style_status_rows(row):
     # Style only the Status column (second column)
     return ["", style_str]
 
+
 styled_status_df = status_df.style.apply(style_status_rows, axis=1)
 st.dataframe(styled_status_df, use_container_width=True, hide_index=True)
 
-# Global Method Options
+# --- Global Method Optimization Options ---
 st.subheader("Multiplex Splitting Decision")
 split_method = st.checkbox(
     "Split into 2 Multiplex Groups?", 
@@ -2530,20 +2917,31 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
             targets_pos = pd.DataFrame()
             targets_neg = pd.DataFrame()
             
-            if st.session_state.input_mode == "GNPS2 Task ID":
+            # Determine effective mode for processing
+            effective_mode = st.session_state.input_mode
+            if effective_mode == "Test Data":
+                if st.session_state.test_data_mode == "Option 1: Manual Input Test Data":
+                    effective_mode = "Manual Input"
+                elif st.session_state.test_data_mode == "Option 2: GNPS2 Task ID Test Data":
+                    effective_mode = "GNPS2 Task ID"
+                elif st.session_state.test_data_mode == "Option 3: Everything Bagel Task ID Test Data":
+                    effective_mode = "Everything Bagel Task ID"
+
+            if effective_mode == "GNPS2 Task ID":
+                # Check if we use the test task ID or the user-entered one
+                active_task_id = "20a59d94003c41168a5186a00e2ac086" if st.session_state.input_mode == "Test Data" else st.session_state.get('gnps_task_id', '')
+                
                 fetched = st.session_state.get('gnps_data_fetched')
-                if fetched:
+                if fetched and fetched.get('task_id') == active_task_id:
                     gnps_df = fetched['gnps_df']
                     mzmine_df = fetched['mzmine_df']
                     mgf_content = fetched['mgf_content']
                     is_gnps2 = fetched['is_gnps2']
-                    task_id = fetched['task_id']
-                    st.write(f"✓ Using cached data for Task ID: `{task_id}`")
+                    st.write(f"✓ Using cached data for Task ID: `{active_task_id}`")
                 else:
-                    # Fallback fetch
-                    task_id = st.session_state.get('gnps_task_id', '')
-                    st.write(f"🌐 **Fetching data for GNPS Task ID:** `{task_id}`...")
-                    gnps_df, mzmine_df, mgf_content, is_gnps2 = load_gnps_task_data(task_id)
+                    # Fallback fetch if not cached
+                    st.write(f"🌐 **Fetching data for GNPS Task ID:** `{active_task_id}`...")
+                    gnps_df, mzmine_df, mgf_content, is_gnps2 = load_gnps_task_data(active_task_id)
                 
                 st.success(f"✓ Successfully fetched data from {'GNPS2' if is_gnps2 else 'GNPS1'}")
                 
@@ -2575,9 +2973,9 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
                         col_targets_formula=col_map['targets_formula']
                     )
                 
-                if (polarity_mode == "Negative Only") or (polarity_mode == "Positive & Negative" and targets_pos.empty):
-                     st.write("🔍 Matching ESI− targets...")
-                     targets_neg = process_polarity(
+                if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                    st.write("🔍 Matching ESI− targets...")
+                    targets_neg = process_polarity(
                         gnps_df, mzmine_df, "Negative", targets, "25,35,45", 
                         rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min,
                         col_gnps_compound=col_map['gnps_compound'],
@@ -2601,33 +2999,108 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
                 
                 if generate_skyline and mgf_content:
                     mgf_file = io.BytesIO(mgf_content)
-                    mgf_file.name = f"{task_id}.mgf"
+                    mgf_file.name = f"{active_task_id}.mgf"
                     if not targets_pos.empty:
                         mgf_pos_files = [mgf_file]
                     if not targets_neg.empty:
                         mgf_neg_files = [mgf_file]
-            
-            elif st.session_state.input_mode == "Manual Input":
-                # Load targets from Compounds.csv (Targeted workflow)
-                f_compounds.seek(0)
+
+            elif effective_mode == "Everything Bagel Task ID":
+                active_task_id = "bb0e73ec72fd441db8c77f1d92c57e3d" if st.session_state.input_mode == "Test Data" else st.session_state.get('bagel_task_id', '')
+
+                fetched = st.session_state.get('gnps_data_fetched')
+                if fetched and fetched.get('task_id') == active_task_id:
+                    gnps_df = fetched['gnps_df']
+                    mzmine_df = fetched['mzmine_df']
+                    mgf_content = fetched['mgf_content']
+                    is_gnps2 = fetched['is_gnps2']
+                    st.write(f"✓ Using cached data for Task ID: `{active_task_id}`")
+                else:
+                    # Fallback fetch if not cached
+                    st.write(f"🌐 **Fetching data for Everything Bagel Task ID:** `{active_task_id}`...")
+                    gnps_df, mzmine_df, mgf_content, is_gnps2 = load_eb_task_data(active_task_id)
+
+                st.success(f"✓ Successfully fetched data from Everything Bagel")
+
+                # Get custom column mappings from session state
+                col_map = get_col_mapping()
+
+                # Process based on selected polarity mode
+                if polarity_mode in ["Positive & Negative", "Positive Only"]:
+                    st.write("🔍 Matching ESI+ targets...")
+                    targets_pos = process_polarity(
+                        gnps_df, mzmine_df, "Positive", targets, "25,35,45",
+                        rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min,
+                        col_gnps_compound=col_map['gnps_compound'],
+                        col_gnps_scan=col_map['gnps_scan'],
+                        col_gnps_cas=col_map['gnps_cas'],
+                        col_gnps_smiles=col_map['gnps_smiles'],
+                        col_gnps_formula=col_map['gnps_formula'],
+                        col_gnps_adduct=col_map['gnps_adduct'],
+                        col_mzmine_scan=col_map['mzmine_scan'],
+                        col_mzmine_mz=col_map['mzmine_mz'],
+                        col_mzmine_rt=col_map['mzmine_rt'],
+                        col_mzmine_rt_start=col_map['mzmine_rt_start'],
+                        col_mzmine_rt_end=col_map['mzmine_rt_end'],
+                        col_mzmine_height=col_map['mzmine_height'],
+                        col_mzmine_charge=col_map['mzmine_charge'],
+                        col_targets_compound=col_map['targets_compound'],
+                        col_targets_cas=col_map['targets_cas'],
+                        col_targets_smiles=col_map['targets_smiles'],
+                        col_targets_formula=col_map['targets_formula']
+                    )
+
+                if polarity_mode in ["Positive & Negative", "Negative Only"]:
+                    st.write("🔍 Matching ESI− targets...")
+                    targets_neg = process_polarity(
+                        gnps_df, mzmine_df, "Negative", targets, "25,35,45",
+                        rt_window_mode, rt_margin_min, rt_margin_pct, expected_peak_width_min,
+                        col_gnps_compound=col_map['gnps_compound'],
+                        col_gnps_scan=col_map['gnps_scan'],
+                        col_gnps_cas=col_map['gnps_cas'],
+                        col_gnps_smiles=col_map['gnps_smiles'],
+                        col_gnps_formula=col_map['gnps_formula'],
+                        col_gnps_adduct=col_map['gnps_adduct'],
+                        col_mzmine_scan=col_map['mzmine_scan'],
+                        col_mzmine_mz=col_map['mzmine_mz'],
+                        col_mzmine_rt=col_map['mzmine_rt'],
+                        col_mzmine_rt_start=col_map['mzmine_rt_start'],
+                        col_mzmine_rt_end=col_map['mzmine_rt_end'],
+                        col_mzmine_height=col_map['mzmine_height'],
+                        col_mzmine_charge=col_map['mzmine_charge'],
+                        col_targets_compound=col_map['targets_compound'],
+                        col_targets_cas=col_map['targets_cas'],
+                        col_targets_smiles=col_map['targets_smiles'],
+                        col_targets_formula=col_map['targets_formula']
+                    )
+
+                if generate_skyline and mgf_content:
+                    mgf_file = io.BytesIO(mgf_content)
+                    mgf_file.name = f"{active_task_id}.mgf"
+                    if not targets_pos.empty:
+                        mgf_pos_files = [mgf_file]
+                    if not targets_neg.empty:
+                        mgf_neg_files = [mgf_file]
+
+            elif effective_mode == "Manual Input":
+                # Handle binary file handles (Test Data) or UploadedFiles (Manual)
+                if hasattr(f_compounds, 'seek'):
+                    f_compounds.seek(0)
+                
                 targets = pd.read_csv(f_compounds, encoding='latin1')
                 col_map = get_col_mapping()
                 targets['clean_cas'] = targets.get(col_map['targets_cas'], pd.Series(dtype=str)).apply(clean_cas)
-                st.write(f"✓ Loaded {len(targets)} target compounds from Compounds.csv")
-                st.write(f"✓ Processing {len(f_gnps_pos) if f_gnps_pos else 0} ESI+ dataset(s)")
-                st.write(f"✓ Processing {len(f_gnps_neg) if f_gnps_neg else 0} ESI− dataset(s)")
-                st.info(f"📊 mzML files: ESI+ = {'✓ Uploaded' if f_mzml_pos else '✗ Not uploaded'}, ESI− = {'✓ Uploaded' if f_mzml_neg else '✗ Not uploaded'}")
+                
+                st.write(f"✓ Loaded {len(targets)} target compounds")
                 
                 # Process based on selected polarity mode
                 if polarity_mode in ["Positive & Negative", "Positive Only"]:
-                    targets_pos = run_polarity_multipe(f_gnps_pos, f_mzmine_pos, "Positive")
+                    if f_gnps_pos and f_mzmine_pos:
+                        targets_pos = run_polarity_multipe(f_gnps_pos, f_mzmine_pos, "Positive")
                 
                 if polarity_mode in ["Positive & Negative", "Negative Only"]:
-                    targets_neg = run_polarity_multipe(f_gnps_neg, f_mzmine_neg, "Negative")
-            
-            elif st.session_state.input_mode == "Test Data":
-                st.error("Test Data mode not implemented for this update.")
-                st.stop()
+                    if f_gnps_neg and f_mzmine_neg:
+                        targets_neg = run_polarity_multipe(f_gnps_neg, f_mzmine_neg, "Negative")
             
             # Check if results are empty
             if targets_pos.empty and targets_neg.empty:
@@ -2811,7 +3284,7 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
                 st.warning(f"⚠️ **No Skyline transitions were generated**, so no Skyline_Transition-List file(s) will appear in the ZIP. This happens when: (1) no MGF file was uploaded for a polarity, or (2) none of the MGF spectra's precursor m/z fell within ±{compound_match_ppm_tolerance} ppm of a matched target's m/z (and, if RT was available in the MGF, within that target's RT window). Check the debug log above for exact counts.")
 
         st.session_state['results'] = {
-            'pos': final_pos, 'neg': final_neg, 
+            'pos': final_pos, 'neg': final_neg,
             'fc_pos': fig_c_pos, 'fc_neg': fig_c_neg,
             'fp_pos': fig_p_pos, 'fp_neg': fig_p_neg,
             'fig_rt_pos': fig_rt_pos, 'fig_rt_neg': fig_rt_neg,
@@ -2835,16 +3308,11 @@ if st.button("▶ Evaluate & Optimize Method", type="primary", disabled=not all_
 
 def build_compound_selector(df, key_prefix, title="Select Compounds to Include"):
     """
-    Creates an interactive compound selector with checkboxes.
-    Returns a filtered dataframe based on user selections.
-    
-    Args:
-        df: DataFrame with compounds
-        key_prefix: Unique prefix for session state keys (e.g., "pos_g1", "neg_g2")
-        title: Display title
-    
-    Returns:
-        Filtered dataframe with only selected compounds
+    Generates an interactive compound selector widget for filtering compounds within a DataFrame.
+    This allows users to individually select or deselect compounds, providing fine-grained control
+    over which targets are included in the final inclusion lists. It also includes "Select All"
+    and "Deselect All" buttons for convenience.
+    Returns a new DataFrame containing only the compounds selected by the user.
     """
     if df.empty:
         return df
@@ -2861,7 +3329,7 @@ def build_compound_selector(df, key_prefix, title="Select Compounds to Include")
         for cmp in current_compounds:
             if cmp not in st.session_state[selection_key]:
                 st.session_state[selection_key][cmp] = True
-    
+
     with st.expander(f"✏️ {title} ({len(df)} compounds)", expanded=False):
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
@@ -2949,11 +3417,11 @@ if 'results' in st.session_state:
         if r['mode'] in ["Positive & Negative", "Positive Only"] and not r['pos'].empty:
             st.markdown("#### 📍 ESI+ (Positive)")
             st.dataframe(r['pos'], width='stretch')
-
+        
         if r['mode'] in ["Positive & Negative", "Negative Only"] and not r['neg'].empty:
             st.markdown("#### 📍 ESI− (Negative)")
             st.dataframe(r['neg'], width='stretch')
-
+            
     with tab_metrics:
         st.subheader("📊 Points Per Peak Figures")
         if r['mode'] == "Positive & Negative" and r['fp_pos'] and r['fp_neg']:
@@ -3078,7 +3546,7 @@ if 'results' in st.session_state:
                         st.pyplot(fig)
         else:
             st.info("ℹ️ No XIC figures available. Upload mzML files for chromatogram visualization.")
-            
+
     with tab_skyline:
         # Skyline Output Section
         has_skyline_content = (not r['skyline_pos'].empty or not r['skyline_neg'].empty or
@@ -3163,7 +3631,7 @@ if 'results' in st.session_state:
                     key="download_skyline_unmatched_neg"
                 )
         else:
-            st.info("ℹ️ No Skyline Transitions generated. Enable Skyline Mass List in Step 3 and provide MGF files to generate.")
+            st.info("ℹ️ No Skyline Transitions generated. Enable Skyline Mass List and provide MGF files to generate.")
             
     with tab_inclusion:
         # Inclusion List / MS Export
