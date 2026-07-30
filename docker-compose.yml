@@ -5,8 +5,6 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: quant-streamlit
-    env_file:
-      - .env
     volumes:
       - ./logs:/app/logs:rw
     networks:
@@ -20,6 +18,8 @@ services:
       LETSENCRYPT_HOST: quant.gnps2.org
       LETSENCRYPT_EMAIL: mwang87@gmail.com
       ENVIRONMENT_MODE: gnps
+    ports:
+    - "8007:5000"
 
 networks:
   nginx-net:
