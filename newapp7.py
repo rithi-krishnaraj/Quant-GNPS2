@@ -352,11 +352,15 @@ def load_eb_task_data(task_id, fetch_mgf=True):
     st.write(f"✓ Successfully pulled Library Results (`{lib_path}`)")
     # EB names differ from FBMN's library results; add the FBMN names so the existing merge works.
     # query_scan corresponds to the quantification table's "row ID".
-    # Newer EB versions call the compound name column NAME instead of COMPOUND_NAME.
+    # Newer EB versions call the compound name column NAME instead of COMPOUND_NAME, and some
+    # library entries fill only one of the two, so later columns fill gaps left by earlier ones.
     for fbmn_col, eb_cols in [("#Scan#", ["query_scan"]), ("Compound_Name", ["COMPOUND_NAME", "NAME"]), ("MQScore", ["cosine"])]:
-        eb_col = next((c for c in eb_cols if c in gnps_df.columns), None)
-        if fbmn_col not in gnps_df.columns and eb_col is not None:
-            gnps_df = gnps_df.assign(**{fbmn_col: gnps_df[eb_col]})
+        present = [c for c in eb_cols if c in gnps_df.columns]
+        if fbmn_col not in gnps_df.columns and present:
+            values = gnps_df[present[0]]
+            for c in present[1:]:
+                values = values.replace(r"^\s*$", np.nan, regex=True).fillna(gnps_df[c])
+            gnps_df = gnps_df.assign(**{fbmn_col: values})
 
     # 3. Consensus MS/MS MGF (Conditional) -- written by EB's feature finding, so it lives in the EB task.
     mgf_content = None
