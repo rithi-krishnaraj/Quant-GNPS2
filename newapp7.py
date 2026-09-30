@@ -53,14 +53,24 @@ GNPS2_MGF_PATHS = [
     #"nf_output/network_overlay/specs_ms.mgf",        # fallback seen on some task configurations
 ]
 
-GNPS2_FEATURE_LIBRARY_PATHS = [ #feature library search results (annotations) for Everything Bagel
-    "nf_output/feature_library_search/merged_feature_library_search_results.tsv"
+# Everything Bagel (EB) runs its own feature finding, so its outputs live under
+# nf_output/feature_finding/ instead of FBMN's nf_output/clustering/.
+# Same paths and lookup logic as FBMN-STATS-GUIde (src/fileselection.py, load_from_gnps2_eb).
+GNPS2_EB_QUANT_TABLE_PATHS = [ # MZmine-style feature table with per-sample "Peak area" columns
+    "nf_output/feature_finding/feature_finding_results/aligned_features.csv",
+]
+GNPS2_EB_FEATURE_LIBRARY_PATHS = [ # feature library search results (annotations)
+    "nf_output/feature_library_search/merged_feature_library_search_results.tsv",
+]
+# An FBMN task launched downstream of EB keeps its own library results and networking,
+# but reads its features from the upstream EB task (the "inputfeatures" parameter).
+GNPS2_FBMN_LIBRARY_PATHS = [
+    "nf_output/library/merged_results_with_gnps.tsv",
 ]
 
-GNPS2_RT_BOUNDS_PATHS = [ #feature quantification table with RT bounds (min/max) for each feature
+GNPS2_RT_BOUNDS_PATHS = [ # optional: per-sample RT_start / RT_end for each EB feature
     "nf_output/feature_finding/feature_finding_results/aligned_rt_bounds.csv"
 ]
-
 
 
 
@@ -84,19 +94,48 @@ def _fetch_gnps2_file_bytes(task_id, result_path):
 
 def _fetch_gnps2_dataframe_multi(task_id, candidate_paths, delimiter="\t"):
     """
-    Attempts to fetch and parse a GNPS2 task result file into a pandas DataFrame.
-    It iterates through a list of `candidate_paths` in priority order, returning the
-    first one that successfully yields a non-empty DataFrame.
-    Returns a tuple of (dataframe, matched_path) on success, or (None, None) if no valid
-    dataframe can be retrieved from any of the provided paths.
+    Tries each GNPS2 result path in priority order (on the prod, beta and de mirrors) and returns
+    (dataframe, matched_path) for the first non-empty one, or (None, None) if none could be retrieved.
+    Uses requests because GNPS2 rejects pandas' default urllib client with HTTP 403.
     """
     for path in candidate_paths:
+        for server in ["prod", "beta", "de"]:
+            try:
+                url = taskresult.determine_gnps2_resultfile_url(task_id, path, gnps2server=server)
+                resp = requests.get(url, timeout=120)
+                resp.raise_for_status()
+                # A missing file returns the GNPS2 HTML page instead of an error status
+                if "html" in resp.headers.get("content-type", ""):
+                    continue
+                df = pd.read_csv(io.BytesIO(resp.content), sep=delimiter)
+                if not df.empty:
+                    return df, path
+            except Exception:
+                continue
+    return None, None
+
+def _fetch_gnps2_task_params(task_id):
+    """Returns the submission parameters of a GNPS2 task from its status.json ({} if unavailable)."""
+    for server in ["prod", "beta", "de"]:
         try:
-            df = taskresult.get_gnps2_task_resultfile_dataframe(task_id, path, delimiter=delimiter)
-            if df is not None and not df.empty:
-                return df, path
+            base_url = taskresult.determine_gnps2_resultfile_url(task_id, "", gnps2server=server).split("/resultfile")[0]
+            resp = requests.get(f"{base_url}/status.json", params={"task": task_id}, timeout=60)
+            resp.raise_for_status()
+            return resp.json().get("submission_parameters", {}) or {}
         except Exception:
             continue
+    return {}
+
+def _get_upstream_eb_features(params):
+    """
+    For an FBMN task run downstream of Everything Bagel, returns (eb_task_id, features_path)
+    parsed from "inputfeatures" (TASKLOCATION/<eb_task_id>/<path>); otherwise (None, None).
+    """
+    input_features = params.get("inputfeatures", "")
+    if params.get("featurefindingtool") == "EVERYTHING_BAGEL" and input_features.startswith("TASKLOCATION/"):
+        parts = input_features.split("/", 2)
+        if len(parts) == 3:
+            return parts[1], parts[2]
     return None, None
 
 def _fetch_gnps2_bytes_multi(task_id, candidate_paths):
@@ -247,59 +286,82 @@ def load_eb_task_data(task_id, fetch_mgf=True):
     """
     Fetches required data from an "Everything Bagel" (EB) GNPS2 task ID.
 
-    Everything Bagel runs its own feature finding step, so there's no MZmine export and no
-    scan-based library search to pull -- instead we go straight to GNPS2 for:
-      1. RT bounds (`GNPS2_RT_BOUNDS_PATHS`)            -- stands in for the MZmine quant table
-      2. Feature library search results (`GNPS2_FEATURE_LIBRARY_PATHS`) -- stands in for the
-         GNPS library results
-      3. Consensus MS/MS MGF (`GNPS2_MGF_PATHS`)
+    Same lookup logic as FBMN-STATS-GUIde's `load_from_gnps2_eb`:
+      - Accepts either the EB task ID or the ID of an FBMN task run downstream of EB. For the latter,
+        the quantification table (and MGF) come from the upstream EB task and the library results
+        from the FBMN task.
+      - EB is GNPS2-only, so there is no GNPS1 fallback.
 
-    This mirrors `load_gnps_task_data`, but skips the GNPS1 fallback (Everything Bagel is a
-    GNPS2-only workflow) and skips `_fetch_mgf_with_provided_logic` (that helper targets FBMN's
-    `nf_output/clustering/` path, which doesn't exist for Everything Bagel).
-
-    Returns (gnps_df, mzmine_df, mgf_content, is_gnps2), the same shape as
-    `load_gnps_task_data`, so it's a drop-in replacement anywhere GNPS2 task data is consumed:
-      - gnps_df   -> Feature Library Results (annotations)
-      - mzmine_df -> RT Bounds table (feature id + rt_range:min / rt_range:max, plus whatever
-                     other columns the export includes)
-      - is_gnps2  -> always True (Everything Bagel is always a GNPS2 workflow)
+    Returns (gnps_df, mzmine_df, mgf_content, is_gnps2), the same shape as `load_gnps_task_data`:
+      - gnps_df   -> Library results (annotations), with FBMN column names added
+      - mzmine_df -> EB quantification table (aligned_features.csv), plus rt_range:min /
+                     rt_range:max derived from aligned_rt_bounds.csv when available
+      - is_gnps2  -> always True
     """
-    # 1. RT Bounds -- used as the signal that this is a reachable Everything Bagel task.
-    rt_bounds_df, rt_bounds_path = _fetch_gnps2_dataframe_multi(task_id, GNPS2_RT_BOUNDS_PATHS, delimiter=",")
+    params = _fetch_gnps2_task_params(task_id)
+    eb_task_id, upstream_features_path = _get_upstream_eb_features(params)
+    if eb_task_id:
+        st.write(f"↳ FBMN task downstream of Everything Bagel task `{eb_task_id}` — pulling the quantification table from there.")
+        quant_task_id = eb_task_id
+        quant_paths = [upstream_features_path] + GNPS2_EB_QUANT_TABLE_PATHS
+    else:
+        quant_task_id = task_id
+        quant_paths = GNPS2_EB_QUANT_TABLE_PATHS
 
-    if rt_bounds_df is None:
+    # 1. Quantification table -- used as the signal that this is a reachable EB task.
+    mzmine_df, quant_path = _fetch_gnps2_dataframe_multi(quant_task_id, quant_paths, delimiter=",")
+    if mzmine_df is None:
         raise Exception(
-            f"Failed to fetch data for Everything Bagel Task ID {task_id}. Tried RT Bounds path(s) "
-            f"({', '.join(GNPS2_RT_BOUNDS_PATHS)}). Please double check the Task ID and that the "
+            f"Failed to fetch data for Everything Bagel Task ID {task_id}. Tried quantification table path(s) "
+            f"({', '.join(quant_paths)}) in task {quant_task_id}. Please double check the Task ID and that the "
             f"Everything Bagel workflow completed successfully on GNPS2."
         )
+    st.write(f"✓ Successfully pulled Quantification Table (`{quant_path}`)")
 
-    st.write(f"✓ Successfully pulled RT Bounds")
-    rt_start_found = find_column_ci(rt_bounds_df, MZMINE_RT_START_COL) in rt_bounds_df.columns
-    rt_end_found = find_column_ci(rt_bounds_df, MZMINE_RT_END_COL) in rt_bounds_df.columns
-    if rt_start_found and rt_end_found:
-        st.write("↳ RT boundary columns found (`rt_range:min` / `rt_range:max`) — full peak boundaries available.")
+    # 1b. RT bounds (optional) -- collapse the per-sample RT_start / RT_end columns into the
+    #     rt_range:min / rt_range:max peak boundaries used for RT window calculation.
+    rt_bounds_df, _ = _fetch_gnps2_dataframe_multi(quant_task_id, GNPS2_RT_BOUNDS_PATHS, delimiter=",")
+    start_cols = [c for c in rt_bounds_df.columns if c.endswith("RT_start")] if rt_bounds_df is not None else []
+    end_cols = [c for c in rt_bounds_df.columns if c.endswith("RT_end")] if rt_bounds_df is not None else []
+    if start_cols and end_cols and "row ID" in rt_bounds_df.columns and "row ID" in mzmine_df.columns:
+        bounds = pd.DataFrame({
+            "row ID": rt_bounds_df["row ID"],
+            MZMINE_RT_START_COL: rt_bounds_df[start_cols].apply(pd.to_numeric, errors="coerce").min(axis=1),
+            MZMINE_RT_END_COL: rt_bounds_df[end_cols].apply(pd.to_numeric, errors="coerce").max(axis=1),
+        })
+        mzmine_df = mzmine_df.drop(columns=[MZMINE_RT_START_COL, MZMINE_RT_END_COL], errors="ignore")
+        mzmine_df = mzmine_df.merge(bounds, on="row ID", how="left")
+        st.write("↳ RT boundaries derived from `aligned_rt_bounds.csv` — full peak boundaries available.")
     else:
-        st.info("ℹ️ No RT boundary columns in this RT Bounds file")
+        st.info("ℹ️ No RT bounds available for this task — apex RT will be used for peak boundaries.")
 
-    # 2. Feature Library Results (Annotations) -- since RT Bounds were found, this is confirmed to
-    #    be a reachable Everything Bagel task, so we no longer treat a failure here as "wrong task
-    #    ID" -- it points at this specific file/step instead.
-    gnps_df, lib_path = _fetch_gnps2_dataframe_multi(task_id, GNPS2_FEATURE_LIBRARY_PATHS, delimiter="\t")
+    # 2. Annotations -- the quant table was found, so a failure here points at this specific step
+    #    rather than a wrong task ID. A downstream FBMN task has its own library search results;
+    #    otherwise use EB's feature library search results.
+    gnps_df, lib_path = None, None
+    if eb_task_id:
+        gnps_df, lib_path = _fetch_gnps2_dataframe_multi(task_id, GNPS2_FBMN_LIBRARY_PATHS, delimiter="\t")
+    if gnps_df is None:
+        gnps_df, lib_path = _fetch_gnps2_dataframe_multi(eb_task_id or task_id, GNPS2_EB_FEATURE_LIBRARY_PATHS, delimiter="\t")
     if gnps_df is None:
         raise Exception(
-            f"Task {task_id} was found on GNPS2 (RT Bounds retrieved from `{rt_bounds_path}`), "
-            f"but the Feature Library Results file could not be retrieved from "
-            f"`{GNPS2_FEATURE_LIBRARY_PATHS[0]}`. This can happen if no spectral library was selected "
-            f"for this job, or if the feature library search step failed/is still running."
+            f"Task {task_id} was found on GNPS2 (quantification table retrieved from `{quant_path}`), "
+            f"but no library results could be retrieved. This can happen if no spectral library was selected "
+            f"for this job, or if the task is still running."
         )
-    st.write(f"✓ Successfully pulled Feature Library Results")
+    st.write(f"✓ Successfully pulled Library Results (`{lib_path}`)")
+    # EB names differ from FBMN's library results; add the FBMN names so the existing merge works.
+    # query_scan corresponds to the quantification table's "row ID".
+    # Newer EB versions call the compound name column NAME instead of COMPOUND_NAME.
+    for fbmn_col, eb_cols in [("#Scan#", ["query_scan"]), ("Compound_Name", ["COMPOUND_NAME", "NAME"]), ("MQScore", ["cosine"])]:
+        eb_col = next((c for c in eb_cols if c in gnps_df.columns), None)
+        if fbmn_col not in gnps_df.columns and eb_col is not None:
+            gnps_df = gnps_df.assign(**{fbmn_col: gnps_df[eb_col]})
 
-    # 3. Consensus MS/MS MGF (Conditional)
+    # 3. Consensus MS/MS MGF (Conditional) -- written by EB's feature finding, so it lives in the EB task.
     mgf_content = None
     if fetch_mgf:
-        mgf_content, mgf_path = _fetch_gnps2_bytes_multi(task_id, GNPS2_MGF_PATHS)
+        mgf_content, mgf_path = _fetch_gnps2_bytes_multi(eb_task_id or task_id, GNPS2_MGF_PATHS)
         if mgf_content:
             st.write(f"✓ Successfully pulled Consensus MS/MS MGF")
         else:
@@ -308,7 +370,7 @@ def load_eb_task_data(task_id, fetch_mgf=True):
                 + ", ".join(f"`{p}`" for p in GNPS2_MGF_PATHS)
             )
 
-    return gnps_df, rt_bounds_df, mgf_content, True
+    return gnps_df, mzmine_df, mgf_content, True
 
 
 # =============================================================================
